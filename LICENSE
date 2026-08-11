@@ -1,0 +1,93 @@
+reframe++
+Copyright (c) 2026 shadowyohan. Все права защищены.
+
+================================================================================
+УСЛОВИЯ ИСПОЛЬЗОВАНИЯ
+================================================================================
+
+Исходный код reframe++ опубликован для ознакомления. Публикация исходного кода
+сама по себе не передаёт никаких прав на него.
+
+РАЗРЕШАЕТСЯ:
+
+  1. Просматривать и изучать исходный код.
+  2. Собирать программу из исходного кода и использовать полученную сборку в
+     личных некоммерческих целях.
+  3. Цитировать фрагменты кода в обсуждениях, обзорах и учебных материалах со
+     ссылкой на этот проект.
+
+НЕ РАЗРЕШАЕТСЯ без предварительного письменного разрешения правообладателя:
+
+  1. Распространять исходный код или сборки программы, в том числе изменённые,
+     в том числе в составе других продуктов.
+  2. Использовать программу или её код в коммерческих целях.
+  3. Создавать и распространять производные работы.
+  4. Удалять или изменять уведомления об авторских правах.
+
+================================================================================
+КОМПОНЕНТЫ ТРЕТЬИХ ЛИЦ
+================================================================================
+
+В состав проекта входят компоненты сторонних авторов, распространяемые на
+собственных условиях. Эти условия имеют приоритет над изложенными выше в
+отношении соответствующих компонентов.
+
+Полные тексты — в файле THIRD-PARTY-NOTICES.md.
+
+  Dear ImGui .................. MIT
+  MinHook ..................... BSD 2-Clause
+  nanosvg ..................... zlib
+  Заголовки NVENC ............. MIT (NVIDIA)
+
+================================================================================
+ОТСУТСТВИЕ ГАРАНТИЙ
+================================================================================
+
+ПРОГРАММА ПРЕДОСТАВЛЯЕТСЯ «КАК ЕСТЬ», БЕЗ КАКИХ-ЛИБО ГАРАНТИЙ, ЯВНЫХ ИЛИ
+ПОДРАЗУМЕВАЕМЫХ, ВКЛЮЧАЯ, НО НЕ ОГРАНИЧИВАЯСЬ, ГАРАНТИИ ПРИГОДНОСТИ ДЛЯ
+КОНКРЕТНЫХ ЦЕЛЕЙ И ОТСУТСТВИЯ НАРУШЕНИЙ ПРАВ. НИ ПРИ КАКИХ ОБСТОЯТЕЛЬСТВАХ
+ПРАВООБЛАДАТЕЛЬ НЕ НЕСЁТ ОТВЕТСТВЕННОСТИ ПО КАКИМ-ЛИБО ИСКАМ, ЗА УЩЕРБ ИЛИ ПО
+ИНЫМ ТРЕБОВАНИЯМ, ВОЗНИКШИМ ИЗ ИСПОЛЬЗОВАНИЯ ПРОГРАММЫ ИЛИ ИНЫХ ДЕЙСТВИЙ С НЕЙ.
+
+Программа выполняет внедрение кода в сторонние процессы для захвата изображения.
+Использование этой возможности с приложениями, чьи правила это запрещают, — в том
+числе с играми, защищёнными системами противодействия читерству, — производится
+исключительно на риск пользователя.
+
+================================================================================
+ENGLISH TRANSLATION (for reference; the Russian text above is authoritative)
+================================================================================
+
+reframe++
+Copyright (c) 2026 shadowyohan. All rights reserved.
+
+The source code of reframe++ is published for review. Publication of the source
+code does not by itself grant any rights to it.
+
+YOU MAY:
+
+  1. View and study the source code.
+  2. Build the program from source and use the resulting build for personal,
+     non-commercial purposes.
+  3. Quote excerpts in discussion, review and educational material, with
+     attribution to this project.
+
+YOU MAY NOT, without prior written permission of the copyright holder:
+
+  1. Redistribute the source code or builds, modified or unmodified, including
+     as part of another product.
+  2. Use the program or its code for commercial purposes.
+  3. Create or distribute derivative works.
+  4. Remove or alter copyright notices.
+
+Third-party components included in this project are distributed under their own
+terms, which prevail over the above for those components. Full texts are in
+THIRD-PARTY-NOTICES.md.
+
+THE PROGRAM IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES
+OR OTHER LIABILITY ARISING FROM THE USE OF THE PROGRAM.
+
+The program injects code into third-party processes in order to capture their
+output. Using this capability with applications whose rules forbid it, including
+games protected by anti-cheat systems, is done entirely at the user's own risk.

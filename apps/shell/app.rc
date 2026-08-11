@@ -1,0 +1,44 @@
+#include <windows.h>
+
+#include "resource.h"
+
+IDI_APPICON ICON "../../icon.ico"
+
+#define RF_VERSION_MAJOR 1
+#define RF_VERSION_MINOR 0
+#define RF_VERSION_PATCH 0
+#define RF_VERSION_BUILD 471
+#define RF_VERSION_STR "1.0.0.471"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    RF_VERSION_MAJOR, RF_VERSION_MINOR, RF_VERSION_PATCH, RF_VERSION_BUILD
+PRODUCTVERSION RF_VERSION_MAJOR, RF_VERSION_MINOR, RF_VERSION_PATCH, RF_VERSION_BUILD
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+FILEFLAGS      VS_FF_DEBUG
+#else
+FILEFLAGS      0
+#endif
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "reframe++"
+            VALUE "FileDescription",  "reframe++ - screen recorder with instant replay"
+            VALUE "FileVersion",      RF_VERSION_STR
+            VALUE "InternalName",     "Reframe"
+            VALUE "OriginalFilename", "Reframe.exe"
+            VALUE "ProductName",      "reframe++"
+            VALUE "ProductVersion",   RF_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
