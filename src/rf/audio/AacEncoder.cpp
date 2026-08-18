@@ -17,10 +17,11 @@ namespace rf {
 AacEncoder::~AacEncoder() { Close(); }
 
 Status AacEncoder::Open(const AudioFormat& format, std::uint32_t bitrate_bps, Ticks100ns epoch,
-                        const std::function<void(PacketPtr)>& on_packet) {
+                        const std::function<void(PacketPtr)>& on_packet, std::uint32_t track) {
     format_ = format;
     epoch_ = epoch;
     on_packet_ = on_packet;
+    track_ = track;
 
     RF_HR(::CoCreateInstance(CLSID_AACMFTEncoder, nullptr, CLSCTX_INPROC_SERVER,
                              IID_PPV_ARGS(&transform_)));
@@ -113,7 +114,7 @@ Status AacEncoder::Drain() {
 
         auto packet = std::make_shared<Packet>();
         packet->kind = MediaKind::Audio;
-        packet->track = 1;
+        packet->track = track_;
         packet->keyframe = true;
         packet->data.assign(data, data + length);
         contig->Unlock();

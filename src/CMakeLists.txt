@@ -2,12 +2,50 @@
 # A standalone DLL: it runs inside somebody else's process, so it links nothing
 # but the Windows SDK, MinHook and the static CRT. Anything else would mean the
 # game has to be able to find our runtime DLLs, which it cannot.
+# Shaders for the in-game overlay, compiled to bytecode headers at build time.
+# Doing it here rather than with D3DCompile at runtime keeps d3dcompiler_47.dll
+# out of the game's process - the hook should add as little as possible to
+# somebody else's address space.
+find_program(RF_FXC fxc
+             HINTS "$ENV{WindowsSdkVerBinPath}/x64"
+             PATHS "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin"
+             PATH_SUFFIXES "10.0.26100.0/x64" "10.0.22621.0/x64" "10.0.22000.0/x64"
+             DOC "HLSL compiler from the Windows SDK")
+if(NOT RF_FXC)
+    message(FATAL_ERROR "fxc.exe not found - it ships with the Windows SDK and is needed for the in-game overlay shaders.")
+endif()
+
+set(RF_HLSL "${CMAKE_CURRENT_SOURCE_DIR}/rf/capture/hook/OverlayQuad.hlsl")
+set(RF_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+foreach(stage vs ps)
+    if(stage STREQUAL "vs")
+        set(entry VsMain)
+        set(profile vs_4_0)
+    else()
+        set(entry PsMain)
+        set(profile ps_4_0)
+    endif()
+    add_custom_command(
+        OUTPUT "${RF_SHADER_DIR}/OverlayQuad_${stage}.h"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${RF_SHADER_DIR}"
+        COMMAND "${RF_FXC}" /nologo /T ${profile} /E ${entry}
+                /Fh "${RF_SHADER_DIR}/OverlayQuad_${stage}.h"
+                /Vn kOverlayQuad_${stage} "${RF_HLSL}"
+        DEPENDS "${RF_HLSL}"
+        COMMENT "Compiling the in-game overlay ${stage} shader"
+        VERBATIM)
+    list(APPEND RF_SHADER_HEADERS "${RF_SHADER_DIR}/OverlayQuad_${stage}.h")
+endforeach()
+
 add_library(reframe-hook SHARED
     rf/capture/hook/HookMain.cpp
+    rf/capture/hook/HookGl.cpp
     rf/capture/hook/HookProtocol.h
+    ${RF_SHADER_HEADERS}
 )
 target_link_libraries(reframe-hook PRIVATE rf::minhook d3d11 dxgi dxguid)
-target_include_directories(reframe-hook PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rf/capture/hook)
+target_include_directories(reframe-hook PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rf/capture/hook
+                                                ${RF_SHADER_DIR})
 set_target_properties(reframe-hook PROPERTIES
     OUTPUT_NAME "reframe-hook64"
     FOLDER "engine"
@@ -41,6 +79,7 @@ add_library(reframe_core STATIC
     rf/core/Time.cpp
 
     rf/gpu/ColorConverter.cpp
+    rf/gpu/CursorPainter.cpp
     rf/gpu/D3DDevice.cpp
     rf/gpu/GpuInfo.cpp
     rf/gpu/Quirks.cpp

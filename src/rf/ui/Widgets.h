@@ -31,6 +31,8 @@ struct UiContext {
 
     bool wants_pointer = false;
 
+    std::uint32_t active_id = 0;
+
     std::vector<ImVec4> reserved;
 
     void Reserve(ImVec2 min, ImVec2 max) { reserved.push_back(ImVec4(min.x, min.y, max.x, max.y)); }

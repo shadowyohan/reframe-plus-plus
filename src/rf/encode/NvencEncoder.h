@@ -1,6 +1,9 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 
 #include "rf/encode/IVideoEncoder.h"
 #include "rf/gpu/ColorConverter.h"
@@ -30,6 +33,8 @@ private:
 
     Status InitSession();
     void DestroySession();
+    void OutputLoop();
+    Status EncodeTexture(ID3D11Texture2D* input, Ticks100ns timestamp);
 
     D3DDevicePtr device_;
     EncoderConfig config_{};
@@ -38,18 +43,25 @@ private:
     CodecPrivate codec_private_;
     EncoderStats stats_{};
 
-    Status DrainSlot(int slot);
-
     std::unique_ptr<Api> api_;
 
-    std::mutex encode_mutex_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> input_[2];
-    int parity_ = 0;
-    bool pending_ = false;
+    std::thread output_thread_;
+    std::atomic<bool> running_{false};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<int> free_slots_;
+    std::deque<int> inflight_;
+
+    static constexpr int kInputTextures = 8;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> inputs_[kInputTextures];
+    int next_input_ = 0;
+    ID3D11Texture2D* last_input_ = nullptr;
+
+    bool direct_rgb_ = false;
+
     std::atomic<bool> force_idr_{false};
     Ticks100ns epoch_ = 0;
     bool open_ = false;
-    bool have_input_ = false;
 };
 
 }

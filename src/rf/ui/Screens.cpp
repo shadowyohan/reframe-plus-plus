@@ -15,12 +15,18 @@ using namespace theme;
 struct Column {
     float x = 0, y = 0, w = 0;
 
+    float* bottom = nullptr;
+
     ImVec2 Next(float height) {
         const ImVec2 pos(x, y);
         y += height + kItemGap;
+        if (bottom) *bottom = y;
         return pos;
     }
-    void Skip(float height) { y += height + kItemGap; }
+    void Skip(float height) {
+        y += height + kItemGap;
+        if (bottom) *bottom = y;
+    }
 
     [[nodiscard]] ImVec2 Peek() const { return ImVec2(x, y); }
 };
@@ -115,6 +121,8 @@ void Menu::Open() {
 void Menu::Close() {
     open_ = false;
 
+    ClosePlayer();
+
     slide_.SetTarget(-600.0f);
 }
 
@@ -134,19 +142,32 @@ void Menu::Navigate(Page page, bool forward) {
     forward_ = forward;
     transitioning_ = true;
     mic_list_open_ = false;
+    gpu_list_open_ = false;
+    monitor_list_open_ = false;
     transition_.Reset(0.0f);
     transition_.SetTarget(1.0f);
 }
 
 void Menu::Draw(UiContext& ctx, ImVec2 screen, AppModel& model, TextureCache& textures) {
     const float x = slide_.Update(ctx.dt, open_ ? spring::kMenu : spring::kExit);
-    if (!open_ && x <= -595.0f) return;
+    if (!open_ && x <= -595.0f) {
+
+        page_ = Page::Main;
+        previous_page_ = Page::Main;
+        transitioning_ = false;
+        mic_list_open_ = false;
+        gpu_list_open_ = false;
+        monitor_list_open_ = false;
+        capture_row_ = -1;
+        rejected_row_ = -1;
+        return;
+    }
 
     const float openness = std::clamp(1.0f + x / 700.0f, 0.0f, 1.0f);
     ctx.dl->AddRectFilled(ImVec2(0, 0), screen,
                           IM_COL32(0, 0, 0, static_cast<int>(102 * openness)));
 
-    ctx.offset = ImVec2(x, 0.0f);
+    ctx.offset = ImVec2(std::round(x), 0.0f);
 
     const float col_x = kScreenPad;
     const float header_y = kScreenPad;
@@ -193,7 +214,8 @@ void Menu::Draw(UiContext& ctx, ImVec2 screen, AppModel& model, TextureCache& te
         const ImVec2 base = ctx.offset;
         const float alpha = ctx.alpha;
 
-        ctx.offset = ImVec2(base.x + (forward_ ? -45.0f * t : 501.0f * t), base.y);
+        ctx.offset =
+            ImVec2(base.x + std::round(forward_ ? -45.0f * t : 501.0f * t), base.y);
         ctx.alpha = alpha * std::clamp(1.0f - t, 0.0f, 1.0f);
 
         const bool was_interactive = ctx.interactive;
@@ -201,7 +223,8 @@ void Menu::Draw(UiContext& ctx, ImVec2 screen, AppModel& model, TextureCache& te
         DrawPage(ctx, previous_page_, panel_min, panel_max, model, textures);
         ctx.interactive = was_interactive;
 
-        ctx.offset = ImVec2(base.x + (forward_ ? 501.0f * (1.0f - t) : -45.0f * (1.0f - t)), base.y);
+        ctx.offset = ImVec2(
+            base.x + std::round(forward_ ? 501.0f * (1.0f - t) : -45.0f * (1.0f - t)), base.y);
         ctx.alpha = alpha * std::clamp(t * 1.4f, 0.0f, 1.0f);
         DrawPage(ctx, page_, panel_min, panel_max, model, textures);
 
@@ -228,15 +251,21 @@ void Menu::OpenInPlayer(AppModel& model, const std::filesystem::path& file) {
         if (model.on_open_file) model.on_open_file(file);
         return;
     }
-    model.player->SetVolume(volume_);
-    model.player->Play();
+    player_ = model.player;
+    player_->SetVolume(volume_);
+    player_->Play();
     player_open_ = true;
     player_slide_.Reset(60.0f);
     player_slide_.SetTarget(0.0f);
 }
 
 void Menu::ClosePlayer(AppModel& model) {
-    if (model.player) model.player->Close();
+    player_ = model.player;
+    ClosePlayer();
+}
+
+void Menu::ClosePlayer() {
+    if (player_) player_->Close();
     player_open_ = false;
 }
 
@@ -362,7 +391,9 @@ void Menu::PlayerPanel(UiContext& ctx, ImVec2 screen, AppModel& model) {
         {
             Interaction mute = Hit(ctx, HashId("player-mute"), ImVec2(x, row_y),
                                    ImVec2(x + kBtn, row_y + kBtn));
-            DrawIcon(ctx, volume_ > 0.001f ? "volume-high" : "sound", ImVec2(x, row_y), kBtn, kText,
+
+            DrawIcon(ctx, volume_ > 0.001f ? "volume-high" : "volume-off", ImVec2(x, row_y), kBtn,
+                     kText,
                      1.0f + 0.1f * mute.hover);
             if (mute.clicked) {
                 volume_ = volume_ > 0.001f ? 0.0f : 1.0f;
@@ -410,6 +441,18 @@ void Menu::DrawPage(UiContext& ctx, Page page, ImVec2 panel_min, ImVec2 panel_ma
 
     ctx.reserved.clear();
 
+    const int index = static_cast<int>(page);
+    const ImVec2 view_min = panel_min;
+    const ImVec2 view_max(panel_max.x, BackRowPos(panel_min, panel_max).y - kItemGap);
+
+    const float measured = page_height_[index];
+    const bool scrolls = page != Page::Gallery && measured > view_max.y - view_min.y;
+    if (scrolls)
+        page_scroll_.Begin(ctx, HashId("page-scroll", static_cast<std::uint32_t>(index)), view_min,
+                           view_max, measured);
+
+    content_bottom_ = panel_min.y + kPanelPad;
+
     switch (page) {
         case Page::Main:     PageMain(ctx, panel_min, panel_max, model, textures); break;
         case Page::Settings: PageSettings(ctx, panel_min, panel_max, model); break;
@@ -419,11 +462,25 @@ void Menu::DrawPage(UiContext& ctx, Page page, ImVec2 panel_min, ImVec2 panel_ma
         case Page::Keybinds: PageKeybinds(ctx, panel_min, panel_max, model); break;
         case Page::Gallery:  PageGallery(ctx, panel_min, panel_max, model, textures); break;
     }
+
+    page_height_[index] = content_bottom_ - view_min.y + kPanelPad;
+    if (scrolls) page_scroll_.End(ctx);
+
+    if (page != Page::Main) {
+        const float content_w = kPanelW - 2 * kPanelPad;
+        if (BackRow(ctx, panel_min, panel_max, content_w)) {
+            capture_row_ = -1;
+            Navigate(page == Page::Settings || page == Page::Gallery ? Page::Main : Page::Settings,
+                     false);
+        }
+    }
+    Footer(ctx, panel_min, panel_max, model);
 }
 
 void Menu::PageMain(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model,
                     TextureCache& textures) {
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
 
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "галерея");
 
@@ -538,11 +595,12 @@ void Menu::PageMain(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel
         if (row.clicked || btn) Navigate(Page::Settings, true);
     }
 
-    Footer(ctx, panel_min, panel_max, model);
 }
 
-void Menu::PageSettings(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model) {
+void Menu::PageSettings(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
+                        AppModel& model) {
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "настройки");
 
     struct Entry {
@@ -572,13 +630,30 @@ void Menu::PageSettings(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppM
         if (row.clicked || btn) Navigate(entry.page, true);
     }
 
-    if (BackRow(ctx, panel_min, panel_max, col.w)) Navigate(Page::Main, false);
-    Footer(ctx, panel_min, panel_max, model);
+    {
+        Settings& s = *model.settings;
+        const ImVec2 pos = col.Next(kRowH_Slider);
+        Interaction row = Row(ctx, HashId("s-uiscale"), pos, ImVec2(col.w, kRowH_Slider));
+        RowIcon(ctx, row, pos, "gallery");
+        RowTitle(ctx, pos, "Размер интерфейса");
+        RowSubtitle(ctx, pos, "Масштаб меню и подсказок");
+
+        float percent = s.ui_scale * 100.0f;
+        const std::string label = std::format("{}%", static_cast<int>(percent + 0.5f));
+        if (Slider(ctx, HashId("s-uiscale-s"), pos, col.w, percent, kUiScaleMin * 100.0f,
+                   kUiScaleMax * 100.0f, label.c_str())) {
+            s.ui_scale = percent / 100.0f;
+            if (model.on_settings_changed) model.on_settings_changed();
+        }
+    }
+
 }
 
-void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model) {
+void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
+                       AppModel& model) {
     Settings& s = *model.settings;
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
     bool dirty = false;
 
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "видео");
@@ -601,6 +676,21 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMode
     }
 
     {
+        const ImVec2 pos = col.Next(kRowH_TwoLine);
+        Interaction row = Row(ctx, HashId("v-cursor"), pos, ImVec2(col.w, kRowH_TwoLine));
+        RowIcon(ctx, row, pos, "gallery");
+        RowTitle(ctx, pos, "Рисовать курсор");
+        RowSubtitle(ctx, pos, "Указатель мыши в записи", 41.0f);
+
+        bool cursor = s.capture_cursor;
+        if (Toggle(ctx, HashId("v-cursor-t"), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f),
+                   cursor)) {
+            s.capture_cursor = cursor;
+            dirty = true;
+        }
+    }
+
+    {
         const ImVec2 pos = col.Next(kRowH_Slider);
         Interaction row = Row(ctx, HashId("v-replay"), pos, ImVec2(col.w, kRowH_Slider));
         RowIcon(ctx, row, pos, "repeat-circle");
@@ -613,6 +703,206 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMode
             s.replay_seconds = static_cast<std::uint32_t>(seconds + 0.5f);
             dirty = true;
         }
+    }
+
+    if (model.monitors.size() > 1 && !s.capture_focused_window_only) {
+        {
+            const ImVec2 pos = col.Next(kRowH_TwoLine);
+            Interaction row = Row(ctx, HashId("v-follow"), pos, ImVec2(col.w, kRowH_TwoLine));
+            RowIcon(ctx, row, pos, "monitor");
+            RowTitle(ctx, pos, "Следовать за курсором");
+            RowSubtitle(ctx, pos, "Экран меняется за курсором", 41.0f);
+
+            bool follow = s.monitor_follow_cursor;
+            if (Toggle(ctx, HashId("v-follow-t"), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f),
+                       follow)) {
+                s.monitor_follow_cursor = follow;
+                dirty = true;
+            }
+        }
+
+        if (s.monitor_follow_cursor) {
+            const ImVec2 pos = col.Next(kRowH_Slider);
+            Interaction row = Row(ctx, HashId("v-follow-delay"), pos, ImVec2(col.w, kRowH_Slider));
+            RowIcon(ctx, row, pos, "speedometer");
+            RowTitle(ctx, pos, "Задержка переключения");
+            RowSubtitle(ctx, pos, "Пауза перед сменой экрана");
+
+            float seconds = static_cast<float>(s.monitor_switch_delay_ms) / 1000.0f;
+            const std::string label =
+                seconds < 0.05f ? std::string("сразу") : std::format("{:.1f} с", seconds);
+            if (Slider(ctx, HashId("v-follow-delay-s"), pos, col.w, seconds, 0.0f, 10.0f,
+                       label.c_str())) {
+                s.monitor_switch_delay_ms = static_cast<std::uint32_t>(seconds * 1000.0f + 0.5f);
+                dirty = true;
+            }
+        }
+
+        const bool locked = s.monitor_follow_cursor;
+        constexpr float kItemH = 36.0f;
+        const float row_h =
+            kRowH_TwoLine +
+            (monitor_list_open_ ? static_cast<float>(model.monitors.size()) * kItemH + 10.0f : 0.0f);
+
+        std::size_t selected = 0;
+        for (std::size_t i = 0; i < model.monitors.size(); ++i)
+            if (model.monitors[i].device_name == s.capture_monitor) selected = i;
+
+        const ImVec2 pos = col.Next(row_h);
+        ctx.dl->AddRectFilled(ctx.At(pos), ctx.At(ImVec2(pos.x + col.w, pos.y + row_h)),
+                              ctx.Fade(kRowBg), kRowRadius);
+
+        Interaction head = locked ? Interaction{}
+                                  : Hit(ctx, HashId("v-monitor"), pos,
+                                        ImVec2(pos.x + col.w, pos.y + kRowH_TwoLine));
+        const ImU32 text_col = locked ? kTextMuted : kText;
+        DrawIcon(ctx, "monitor-recorder", ImVec2(pos.x + kRowIconX, pos.y + kRowIconY), kRowIcon,
+                 text_col, 1.0f + 0.10f * head.hover);
+        DrawText(ctx, Font::Body, ImVec2(pos.x + kRowTextX, pos.y + 14.0f), text_col, "Монитор");
+        RowSubtitle(ctx, pos,
+                    ElideEnd(ctx, Font::Small,
+                             locked ? std::string("Выбирается автоматически")
+                                    : model.monitors[selected].name,
+                             col.w - kRowTextX - 44.0f)
+                        .c_str(),
+                    41.0f);
+
+        if (!locked) {
+            Spring& turn = ctx.anim->Get(HashId("v-monitor-turn"));
+            turn.SetTarget(monitor_list_open_ ? 1.0f : 0.0f);
+            const float t = turn.Update(ctx.dt, spring::kMenu);
+            const ImVec2 ch_center(pos.x + col.w - 28.0f, pos.y + kRowH_TwoLine * 0.5f);
+            const float angle = t * 1.5707963f;
+            const float ca = std::cos(angle), sa = std::sin(angle);
+            auto rot = [&](float x, float y) {
+                return ctx.At(ImVec2(ch_center.x + x * ca - y * sa, ch_center.y + x * sa + y * ca));
+            };
+            const ImVec2 chevron_pts[3] = {rot(-2.5f, -5.0f), rot(2.5f, 0.0f), rot(-2.5f, 5.0f)};
+            ctx.dl->AddPolyline(
+                chevron_pts, 3,
+                ctx.Fade(IM_COL32(255, 255, 255, 140 + static_cast<int>(100 * head.hover))), 0,
+                2.0f);
+        }
+
+        if (head.clicked) monitor_list_open_ = !monitor_list_open_;
+
+        if (monitor_list_open_ && !locked) {
+            float y = pos.y + kRowH_TwoLine + 4.0f;
+            for (std::size_t i = 0; i < model.monitors.size(); ++i) {
+                const ImVec2 item_pos(pos.x + 10.0f, y);
+                const ImVec2 item_max(pos.x + col.w - 10.0f, y + kItemH);
+                Interaction it = Hit(ctx, HashId("v-monitor-item", static_cast<std::uint32_t>(i)),
+                                     item_pos, item_max);
+                if (it.hover > 0.01f)
+                    ctx.dl->AddRectFilled(
+                        ctx.At(item_pos), ctx.At(item_max),
+                        ctx.Fade(IM_COL32(255, 255, 255, static_cast<int>(18 * it.hover))), 10.0f);
+
+                if (i == selected)
+                    ctx.dl->AddCircleFilled(ctx.At(ImVec2(item_pos.x + 14.0f, y + kItemH * 0.5f)),
+                                            3.5f, ctx.Fade(kAccent), 12);
+
+                DrawText(ctx, Font::Small, ImVec2(item_pos.x + 28.0f, y + 9.0f),
+                         i == selected ? kText : kTextMuted,
+                         ElideEnd(ctx, Font::Small, model.monitors[i].name,
+                                  col.w - 20.0f - 28.0f - 10.0f)
+                             .c_str());
+
+                if (it.clicked) {
+                    s.capture_monitor = model.monitors[i].device_name;
+                    monitor_list_open_ = false;
+                    dirty = true;
+                }
+                y += kItemH;
+            }
+        }
+
+        if (monitor_list_open_) {
+            if (dirty && model.on_settings_changed) model.on_settings_changed();
+            return;
+        }
+    }
+
+    if (model.gpus.size() > 1) {
+        constexpr float kItemH = 36.0f;
+        const float row_h = kRowH_TwoLine +
+                            (gpu_list_open_
+                                 ? static_cast<float>(model.gpus.size()) * kItemH + 10.0f
+                                 : 0.0f);
+
+        std::size_t selected = 0;
+        for (std::size_t i = 1; i < model.gpus.size(); ++i)
+            if (model.gpus[i].luid_low == s.gpu_luid_low &&
+                model.gpus[i].luid_high == s.gpu_luid_high)
+                selected = i;
+
+        const ImVec2 pos = col.Next(row_h);
+        ctx.dl->AddRectFilled(ctx.At(pos), ctx.At(ImVec2(pos.x + col.w, pos.y + row_h)),
+                              ctx.Fade(kRowBg), kRowRadius);
+
+        Interaction head =
+            Hit(ctx, HashId("v-gpu"), pos, ImVec2(pos.x + col.w, pos.y + kRowH_TwoLine));
+        DrawIcon(ctx, "driver", ImVec2(pos.x + kRowIconX, pos.y + kRowIconY), kRowIcon, kText,
+                 1.0f + 0.10f * head.hover);
+        RowTitle(ctx, pos, "Видеокарта");
+        RowSubtitle(ctx, pos,
+                    ElideEnd(ctx, Font::Small, model.gpus[selected].name,
+                             col.w - kRowTextX - 44.0f)
+                        .c_str(),
+                    41.0f);
+
+        Spring& turn = ctx.anim->Get(HashId("v-gpu-turn"));
+        turn.SetTarget(gpu_list_open_ ? 1.0f : 0.0f);
+        const float t = turn.Update(ctx.dt, spring::kMenu);
+        const ImVec2 ch_center(pos.x + col.w - 28.0f, pos.y + kRowH_TwoLine * 0.5f);
+        const float angle = t * 1.5707963f;
+        const float ca = std::cos(angle), sa = std::sin(angle);
+        auto rot = [&](float x, float y) {
+            return ctx.At(ImVec2(ch_center.x + x * ca - y * sa, ch_center.y + x * sa + y * ca));
+        };
+        const ImVec2 chevron_pts[3] = {rot(-2.5f, -5.0f), rot(2.5f, 0.0f), rot(-2.5f, 5.0f)};
+        ctx.dl->AddPolyline(
+            chevron_pts, 3,
+            ctx.Fade(IM_COL32(255, 255, 255, 140 + static_cast<int>(100 * head.hover))), 0, 2.0f);
+
+        if (head.clicked) gpu_list_open_ = !gpu_list_open_;
+
+        if (gpu_list_open_) {
+            float y = pos.y + kRowH_TwoLine + 4.0f;
+            for (std::size_t i = 0; i < model.gpus.size(); ++i) {
+                const ImVec2 item_pos(pos.x + 10.0f, y);
+                const ImVec2 item_max(pos.x + col.w - 10.0f, y + kItemH);
+                Interaction it =
+                    Hit(ctx, HashId("v-gpu-item", static_cast<std::uint32_t>(i)), item_pos, item_max);
+                if (it.hover > 0.01f)
+                    ctx.dl->AddRectFilled(
+                        ctx.At(item_pos), ctx.At(item_max),
+                        ctx.Fade(IM_COL32(255, 255, 255, static_cast<int>(18 * it.hover))), 10.0f);
+
+                if (i == selected)
+                    ctx.dl->AddCircleFilled(ctx.At(ImVec2(item_pos.x + 14.0f, y + kItemH * 0.5f)),
+                                            3.5f, ctx.Fade(kAccent), 12);
+
+                DrawText(ctx, Font::Small, ImVec2(item_pos.x + 28.0f, y + 9.0f),
+                         i == selected ? kText : kTextMuted,
+                         ElideEnd(ctx, Font::Small, model.gpus[i].name,
+                                  col.w - 20.0f - 28.0f - 10.0f)
+                             .c_str());
+
+                if (it.clicked) {
+                    s.gpu_luid_low = model.gpus[i].luid_low;
+                    s.gpu_luid_high = model.gpus[i].luid_high;
+                    gpu_list_open_ = false;
+                    dirty = true;
+                }
+                y += kItemH;
+            }
+        }
+    }
+
+    if (gpu_list_open_) {
+        if (dirty && model.on_settings_changed) model.on_settings_changed();
+        return;
     }
 
     DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "формат вывода");
@@ -693,24 +983,24 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMode
         }
     }
 
-    if (BackRow(ctx, panel_min, panel_max, col.w)) Navigate(Page::Settings, false);
-    Footer(ctx, panel_min, panel_max, model);
     if (dirty && model.on_settings_changed) model.on_settings_changed();
 }
 
-void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model) {
+void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
+                       AppModel& model) {
     Settings& s = *model.settings;
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
     bool dirty = false;
 
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "аудио");
     DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "системные звуки");
 
     auto volume_row = [&](const char* id, const char* icon, const char* title, const char* subtitle,
-                          float& value) {
+                          float& value, bool enabled = true) {
         const ImVec2 pos = col.Next(kRowH_Slider);
         Interaction row = Row(ctx, HashId(id), pos, ImVec2(col.w, kRowH_Slider));
-        RowIcon(ctx, row, pos, icon);
+        RowIcon(ctx, row, pos, (!enabled || value <= 0.001f) ? "volume-off" : icon);
         RowTitle(ctx, pos, title);
         RowSubtitle(ctx, pos, subtitle);
 
@@ -722,9 +1012,38 @@ void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMode
         }
     };
 
-    volume_row("a-sys", "speaker", "Громкость", "Звук игры и приложений", s.system_volume);
+    {
+        const ImVec2 pos = col.Next(kRowH_TwoLine);
+        Interaction row = Row(ctx, HashId("a-sys-on"), pos, ImVec2(col.w, kRowH_TwoLine));
+        RowIcon(ctx, row, pos, s.record_system_audio ? "sound" : "volume-off");
+        RowTitle(ctx, pos, "Записывать");
+        RowSubtitle(ctx, pos, "Звук системы в записи", 41.0f);
+
+        bool on = s.record_system_audio;
+        if (Toggle(ctx, HashId("a-sys-on-t"), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f), on)) {
+            s.record_system_audio = on;
+            dirty = true;
+        }
+    }
+
+    volume_row("a-sys", "speaker", "Громкость", "Звук игры и приложений", s.system_volume,
+               s.record_system_audio);
 
     DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "микрофон");
+
+    {
+        const ImVec2 pos = col.Next(kRowH_TwoLine);
+        Interaction row = Row(ctx, HashId("a-mic-on"), pos, ImVec2(col.w, kRowH_TwoLine));
+        RowIcon(ctx, row, pos, s.record_microphone ? "microphone" : "volume-off");
+        RowTitle(ctx, pos, "Записывать");
+        RowSubtitle(ctx, pos, "Голос в записи", 41.0f);
+
+        bool on = s.record_microphone;
+        if (Toggle(ctx, HashId("a-mic-on-t"), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f), on)) {
+            s.record_microphone = on;
+            dirty = true;
+        }
+    }
 
     {
 
@@ -785,6 +1104,11 @@ void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMode
                          selected ? kText : kTextMuted, item_label.c_str());
 
                 if (it.clicked) {
+
+                    if (!s.record_microphone) {
+                        s.record_microphone = true;
+                        dirty = true;
+                    }
                     if (model.on_pick_mic) model.on_pick_mic(id);
                     mic_list_open_ = false;
                 }
@@ -797,8 +1121,10 @@ void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMode
     }
 
     if (!mic_list_open_) {
-        volume_row("a-mic", "volume-high", "Громкость", "Уровень входного сигнала", s.mic_volume);
-        volume_row("a-gain", "activity", "Усиление", "Дополнительный буст голоса", s.mic_gain);
+        volume_row("a-mic", "volume-high", "Громкость", "Уровень входного сигнала", s.mic_volume,
+                   s.record_microphone);
+        volume_row("a-gain", "activity", "Усиление", "Дополнительный буст голоса", s.mic_gain,
+                   s.record_microphone);
 
         DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "аудиодорожки");
 
@@ -818,16 +1144,22 @@ void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMode
         RowSubtitle(ctx, pos, single ? "Одна звуковая дорожка со звуками" : "Отдельные дорожки для",
                     48.0f);
         RowSubtitle(ctx, pos, single ? "системы и микрофона" : "системы и микрофона", 70.0f);
+
+        if (!single && !s.record_microphone) {
+            const ImVec2 warn = col.Peek();
+            col.Skip(WarningRow(ctx, warn, col.w, kWarnAmber, kWarnAmberBg,
+                                "Вторая дорожка появится только с включённым микрофоном!"));
+        }
     }
 
-    if (BackRow(ctx, panel_min, panel_max, col.w)) Navigate(Page::Settings, false);
-    Footer(ctx, panel_min, panel_max, model);
     if (dirty && model.on_settings_changed) model.on_settings_changed();
 }
 
-void Menu::PageKeybinds(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model) {
+void Menu::PageKeybinds(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
+                        AppModel& model) {
     Settings& s = *model.settings;
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
 
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "горячие клавиши");
 
@@ -853,6 +1185,8 @@ void Menu::PageKeybinds(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppM
         model.pending_mods = 0;
 
         const bool is_modifier = vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT ||
+                                 vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_LMENU ||
+                                 vk == VK_RMENU || vk == VK_LSHIFT || vk == VK_RSHIFT ||
                                  vk == VK_LWIN || vk == VK_RWIN;
         if (vk == VK_ESCAPE) {
             capture_row_ = -1;
@@ -921,16 +1255,13 @@ void Menu::PageKeybinds(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppM
         }
     }
 
-    if (BackRow(ctx, panel_min, panel_max, col.w)) {
-        capture_row_ = -1;
-        Navigate(Page::Settings, false);
-    }
-    Footer(ctx, panel_min, panel_max, model);
 }
 
-void Menu::PageDisk(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model) {
+void Menu::PageDisk(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
+                        AppModel& model) {
     Settings& s = *model.settings;
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
     bool dirty = false;
 
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "диск");
@@ -1006,14 +1337,13 @@ void Menu::PageDisk(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel
     path_row("d-temp", "document", "Временные файлы", s.temp_dir);
     path_row("d-gallery", "gallery", "Галерея", s.output_dir);
 
-    if (BackRow(ctx, panel_min, panel_max, col.w)) Navigate(Page::Settings, false);
-    Footer(ctx, panel_min, panel_max, model);
     if (dirty && model.on_settings_changed) model.on_settings_changed();
 }
 
 void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model,
                        TextureCache& textures) {
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "галерея");
 
     const auto& items = model.gallery_items;
@@ -1107,8 +1437,6 @@ void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMo
 
     scroll_.End(ctx);
 
-    if (BackRow(ctx, panel_min, panel_max, col.w)) Navigate(Page::Main, false);
-    Footer(ctx, panel_min, panel_max, model);
 }
 
 }

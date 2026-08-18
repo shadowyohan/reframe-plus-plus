@@ -52,6 +52,8 @@ public:
 
 private:
     friend class MediaEngineNotify;
+
+    void SelectEveryAudioStream();
     void OnEngineEvent(std::uint32_t event);
     Status EnsureTexture();
 

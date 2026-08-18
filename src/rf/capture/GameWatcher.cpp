@@ -183,7 +183,8 @@ void GameWatcher::Loop() {
         GameVerdict verdict = ClassifyWindow(fg, found);
 
         if (verdict != GameVerdict::Game && (fg != last_seen || verdict != last_verdict)) {
-            RF_DEBUG("game watcher: foreground rejected - {}", ToString(verdict));
+
+            RF_INFO("game watcher: skipped a window - {}", ToString(verdict));
         }
 
         if (verdict != GameVerdict::Game && FindRecordableBelow(found)) {

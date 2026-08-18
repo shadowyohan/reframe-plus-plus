@@ -48,7 +48,7 @@ struct VideoFormat {
 struct AudioFormat {
     std::uint32_t sample_rate = 48'000;
     std::uint32_t channels = 2;
-    std::uint32_t bits = 32;  // engine mixes in float32
+    std::uint32_t bits = 32;
 };
 
-}  // namespace rf
+}

@@ -15,9 +15,9 @@ HANDLE HighResTimer() {
     return timer;
 }
 
-constexpr Ticks100ns kSpinMargin = 3'000;  // 0.3 ms
+constexpr Ticks100ns kSpinMargin = 3'000;
 
-}  // namespace
+}
 
 void PreciseSleepUntil(Ticks100ns deadline) {
     const Ticks100ns now = Now100ns();
@@ -27,7 +27,7 @@ void PreciseSleepUntil(Ticks100ns deadline) {
         const Ticks100ns wait = deadline - now - kSpinMargin;
         if (wait > 0) {
             LARGE_INTEGER due{};
-            due.QuadPart = -wait;  // negative == relative
+            due.QuadPart = -wait;
             if (::SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0))
                 ::WaitForSingleObject(timer, INFINITE);
         }
@@ -46,4 +46,4 @@ MmcssScope::~MmcssScope() {
     if (handle_) ::AvRevertMmThreadCharacteristics(handle_);
 }
 
-}  // namespace rf
+}

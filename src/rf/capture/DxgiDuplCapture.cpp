@@ -28,6 +28,11 @@ Status DxgiDuplCapture::CreateDuplication() {
     if (!output) RF_HR(device_->adapter()->EnumOutputs(0, &output));
     RF_HR(output.As(&output_));
 
+    if (DXGI_OUTPUT_DESC desc{}; SUCCEEDED(output_->GetDesc(&desc))) {
+        desktop_x_ = desc.DesktopCoordinates.left;
+        desktop_y_ = desc.DesktopCoordinates.top;
+    }
+
     static const DXGI_FORMAT kFormats[] = {
         DXGI_FORMAT_B8G8R8A8_UNORM,
         DXGI_FORMAT_R10G10B10A2_UNORM,
@@ -125,8 +130,25 @@ void DxgiDuplCapture::CaptureLoop() {
             ComPtr<ID3D11Texture2D> acquired;
             if (SUCCEEDED(resource.As(&acquired))) {
 
+                ID3D11Texture2D* picture = acquired.Get();
+                if (target_.capture_cursor) {
+                    if (!cursor_ready_) {
+                        if (auto s = cursor_.Init(device_, width_, height_, format_); s.ok())
+                            cursor_ready_ = true;
+                        else
+                            RF_WARN("no cursor in the recording: {}", s.str());
+                    }
+                    if (cursor_ready_) {
+                        ID3D11Texture2D* composed = nullptr;
+                        if (auto s = cursor_.Compose(acquired.Get(), desktop_x_, desktop_y_,
+                                                     &composed);
+                            s.ok() && composed)
+                            picture = composed;
+                    }
+                }
+
                 CapturedFrame frame;
-                frame.texture = acquired.Get();
+                frame.texture = picture;
                 frame.width = width_;
                 frame.height = height_;
                 frame.format = format_;

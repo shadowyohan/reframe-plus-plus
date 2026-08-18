@@ -1,5 +1,7 @@
 add_executable(reframe-tests
     test_main.cpp
+    test_pacer.cpp
+    test_settings.cpp
     test_replay_buffer.cpp
 )
 rf_target_defaults(reframe-tests)

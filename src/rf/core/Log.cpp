@@ -1,5 +1,7 @@
 #include "rf/core/Log.h"
 
+#include <format>
+
 #include <windows.h>
 
 #include <share.h>
@@ -47,13 +49,29 @@ void Init(Level min_level) {
 
     const auto current = dir / "reframe.log";
 
+    constexpr int kHistory = 5;
+    std::filesystem::remove(dir / std::format("reframe.{}.log", kHistory), ec);
+    for (int i = kHistory; i > 1; --i) {
+        std::filesystem::rename(dir / std::format("reframe.{}.log", i - 1),
+                                dir / std::format("reframe.{}.log", i), ec);
+    }
+    std::filesystem::rename(current, dir / "reframe.1.log", ec);
+
     std::filesystem::remove(dir / "reframe.prev.log", ec);
-    std::filesystem::rename(current, dir / "reframe.prev.log", ec);
+    std::filesystem::copy_file(dir / "reframe.1.log", dir / "reframe.prev.log", ec);
 
     g_file = _wfsopen(current.c_str(), L"wb", _SH_DENYWR);
+
+    if (!g_file) {
+        const auto fallback = dir / std::format("reframe-{}.log", ::GetCurrentProcessId());
+        g_file = _wfsopen(fallback.c_str(), L"wb", _SH_DENYWR);
+    }
+
     if (g_file) {
         static constexpr unsigned char kBom[] = {0xEF, 0xBB, 0xBF};
         std::fwrite(kBom, 1, sizeof(kBom), g_file);
+    } else {
+        ::OutputDebugStringA("reframe++: no log file could be opened\n");
     }
 }
 

@@ -27,22 +27,21 @@ struct EncoderConfig {
     VideoFormat format;
     RateControl rate_control = RateControl::CBR;
     std::uint32_t bitrate_kbps = 50'000;
-    std::uint32_t max_bitrate_kbps = 0;  // VBR peak; 0 => 1.5x bitrate
-    std::uint32_t qp = 22;               // ConstQp only
+    std::uint32_t max_bitrate_kbps = 0;
+    std::uint32_t qp = 22;
 
-    // Keyframe cadence. This is the instant-replay knob: the replay buffer can
-    // only be trimmed at keyframe boundaries, so a long GOP saves bitrate but
-    // makes the saved clip's start time coarser. 2s matches ShadowPlay.
     std::uint32_t keyframe_interval_ms = 2'000;
 
     std::uint32_t b_frames = 0;
-    bool low_latency = true;      // no lookahead reordering; replay must be instant
-    bool async_encode = true;     // let the encoder pipeline frames
-    std::uint32_t async_depth = 4;
+    bool low_latency = true;
+    bool async_encode = true;
 
-    // 0..100, maps to the driver's quality-vs-speed preset ladder (on NVENC
+    std::uint32_t async_depth = 12;
 
     std::uint32_t quality_vs_speed = 66;
+
+    std::uint32_t input_width = 0;
+    std::uint32_t input_height = 0;
 
     Ticks100ns epoch = 0;
 

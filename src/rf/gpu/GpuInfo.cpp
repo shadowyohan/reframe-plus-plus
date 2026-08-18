@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <dxgi1_6.h>
 
+#include <algorithm>
 #include <format>
 
 #include <wrl/client.h>
@@ -126,6 +127,57 @@ bool FindAdapterForOutput(void* hwnd, AdapterInfo& out) {
 
     out = adapters.front();
     return true;
+}
+
+namespace {
+
+BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM param) {
+    auto& out = *reinterpret_cast<std::vector<MonitorInfo>*>(param);
+
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (!::GetMonitorInfoW(monitor, &info)) return TRUE;
+
+    MonitorInfo entry;
+    entry.device_name = info.szDevice;
+    entry.handle = monitor;
+    entry.x = info.rcMonitor.left;
+    entry.y = info.rcMonitor.top;
+    entry.width = static_cast<std::uint32_t>(info.rcMonitor.right - info.rcMonitor.left);
+    entry.height = static_cast<std::uint32_t>(info.rcMonitor.bottom - info.rcMonitor.top);
+    entry.primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+
+    DISPLAY_DEVICEW device{};
+    device.cb = sizeof(device);
+    if (::EnumDisplayDevicesW(info.szDevice, 0, &device, 0) && device.DeviceString[0])
+        entry.description = device.DeviceString;
+    else
+        entry.description = info.szDevice;
+
+    out.push_back(std::move(entry));
+    return TRUE;
+}
+
+}
+
+std::vector<MonitorInfo> EnumerateMonitors() {
+    std::vector<MonitorInfo> out;
+    ::EnumDisplayMonitors(nullptr, nullptr, CollectMonitor, reinterpret_cast<LPARAM>(&out));
+
+    std::sort(out.begin(), out.end(), [](const MonitorInfo& a, const MonitorInfo& b) {
+        if (a.primary != b.primary) return a.primary;
+        return a.x < b.x;
+    });
+    return out;
+}
+
+void* MonitorForDeviceName(const std::wstring& device_name) {
+    if (!device_name.empty()) {
+        for (const MonitorInfo& info : EnumerateMonitors())
+            if (info.device_name == device_name) return info.handle;
+        RF_WARN("the configured display is not attached - using the primary one");
+    }
+    return ::MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
 }
 
 }

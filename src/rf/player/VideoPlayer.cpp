@@ -165,6 +165,7 @@ void VideoPlayer::OnEngineEvent(std::uint32_t event) {
     switch (event) {
         case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
             size_known_.store(true, std::memory_order_release);
+            SelectEveryAudioStream();
             break;
         case MF_MEDIA_ENGINE_EVENT_CANPLAY:
             ready_.store(true, std::memory_order_release);
@@ -184,6 +185,32 @@ void VideoPlayer::OnEngineEvent(std::uint32_t event) {
         default:
             break;
     }
+}
+
+void VideoPlayer::SelectEveryAudioStream() {
+    ComPtr<IMFMediaEngineEx> ex;
+    if (!engine_ || FAILED(engine_.As(&ex))) return;
+
+    DWORD count = 0;
+    if (FAILED(ex->GetNumberOfStreams(&count)) || count == 0) return;
+
+    bool changed = false;
+    for (DWORD i = 0; i < count; ++i) {
+        PROPVARIANT type;
+        ::PropVariantInit(&type);
+        const bool is_audio =
+            SUCCEEDED(ex->GetStreamAttribute(i, MF_MT_MAJOR_TYPE, &type)) &&
+            type.vt == VT_CLSID && *type.puuid == MFMediaType_Audio;
+        ::PropVariantClear(&type);
+        if (!is_audio) continue;
+
+        BOOL selected = FALSE;
+        if (FAILED(ex->GetStreamSelection(i, &selected)) || selected) continue;
+        if (SUCCEEDED(ex->SetStreamSelection(i, TRUE))) changed = true;
+    }
+
+    if (changed && SUCCEEDED(ex->ApplyStreamSelections()))
+        RF_INFO("player: all {} streams selected - every audio track will be heard", count);
 }
 
 Status VideoPlayer::EnsureTexture() {

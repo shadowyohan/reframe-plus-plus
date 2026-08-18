@@ -14,6 +14,9 @@ public:
     ~GameCapture() override;
 
     Status Start(const CaptureTarget& target, const FrameCallback& on_frame) override;
+
+    Status Attach(const CaptureTarget& target);
+    [[nodiscard]] bool attached() const { return attached_; }
     void Stop() override;
 
     [[nodiscard]] CaptureStats stats() const override { return stats_; }
@@ -22,6 +25,9 @@ public:
     [[nodiscard]] std::uint32_t height() const override { return height_; }
 
     [[nodiscard]] std::string game_name() const { return game_name_; }
+
+    void SetOverlay(std::uint32_t handle, std::uint32_t serial, std::uint32_t width,
+                    std::uint32_t height, bool visible);
 
 private:
     void ReaderLoop();
@@ -33,6 +39,7 @@ private:
     FrameCallback on_frame_;
 
     std::uint32_t pid_ = 0;
+    bool attached_ = false;
     std::string game_name_;
 
     void* section_ = nullptr;
@@ -40,8 +47,7 @@ private:
     void* ready_event_ = nullptr;
     hook::SharedState* state_ = nullptr;
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> shared_;
-    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> shared_mutex_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> shared_[hook::kSlots];
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
     std::uint32_t bound_serial_ = 0;
 

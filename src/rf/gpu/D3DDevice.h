@@ -17,6 +17,9 @@ public:
 
     static Status CreateForOutput(void* hwnd, std::shared_ptr<D3DDevice>& out);
 
+    static Status CreateForLuid(std::int32_t luid_low, std::int32_t luid_high,
+                                std::shared_ptr<D3DDevice>& out);
+
     ID3D11Device5* device() const { return device_.Get(); }
     ID3D11DeviceContext4* context() const { return context_.Get(); }
     IDXGIAdapter1* adapter() const { return dxgi_adapter_.Get(); }

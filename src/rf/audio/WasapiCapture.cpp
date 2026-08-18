@@ -12,7 +12,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace rf {
 namespace {
-constexpr REFERENCE_TIME kBufferDuration = 20 * 10'000;  // 20 ms
+constexpr REFERENCE_TIME kBufferDuration = 20 * 10'000;
 }
 
 WasapiCapture::~WasapiCapture() { Stop(); }
@@ -29,8 +29,7 @@ Status WasapiCapture::Start(AudioSource source, const AudioCallback& on_audio,
 
     const EDataFlow flow = (source == AudioSource::SystemLoopback) ? eRender : eCapture;
     if (source == AudioSource::Microphone && !device_id.empty()) {
-        // A concrete microphone was picked in the UI. If it was unplugged
-        // since, fall back to the default rather than recording silence.
+
         if (FAILED(enumerator->GetDevice(ToWide(device_id).c_str(), &device_))) {
             RF_WARN("selected microphone is gone - using the default one");
             device_.Reset();
@@ -43,9 +42,6 @@ Status WasapiCapture::Start(AudioSource source, const AudioCallback& on_audio,
 
     RF_HR(device_->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, nullptr, &client_));
 
-    // One fixed format for every stream: 48 kHz stereo float32. The audio
-    // engine converts from whatever the device runs at, so the mixer can add
-    // loopback and microphone sample-for-sample with no resampler of our own.
     WAVEFORMATEX fmt{};
     fmt.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
     fmt.nChannels = 2;

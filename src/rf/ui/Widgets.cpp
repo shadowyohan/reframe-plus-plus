@@ -146,7 +146,8 @@ Interaction Hit(UiContext& ctx, std::uint32_t id, ImVec2 min, ImVec2 max, bool h
     out.hovered = ctx.interactive && Inside(ctx.mouse, a, b) &&
                   !(honour_reserved && ctx.Reserved(ctx.mouse));
     out.held = out.hovered && ctx.mouse_down;
-    out.clicked = out.hovered && ctx.mouse_released;
+    if (out.hovered && ctx.mouse_pressed) ctx.active_id = id;
+    out.clicked = out.hovered && ctx.mouse_released && ctx.active_id == id;
     if (out.hovered) ctx.wants_pointer = true;
 
     Spring& hover = ctx.anim->Get(id);
@@ -195,8 +196,21 @@ void RowTitle(UiContext& ctx, ImVec2 row_pos, const char* text) {
 }
 
 void RowSubtitle(UiContext& ctx, ImVec2 row_pos, const char* text, float y) {
-    DrawText(ctx, Font::Small, ImVec2(row_pos.x + theme::kRowTextX, row_pos.y + y),
-             theme::kTextMuted, text);
+
+    constexpr float kControlMargin = 105.0f;
+    const float room = theme::kPanelW - 2 * theme::kPanelPad - theme::kRowTextX - kControlMargin;
+
+    ImFont* font = ctx.fonts->Get(Font::Small);
+    const ImVec2 pos(row_pos.x + theme::kRowTextX, row_pos.y + y);
+    if (!font || font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, text).x <= room) {
+        DrawText(ctx, Font::Small, pos, theme::kTextMuted, text);
+        return;
+    }
+
+    ctx.dl->PushClipRect(ctx.At(ImVec2(pos.x, pos.y - 4.0f)),
+                         ctx.At(ImVec2(pos.x + room, pos.y + font->FontSize + 4.0f)), true);
+    DrawText(ctx, Font::Small, pos, theme::kTextMuted, text);
+    ctx.dl->PopClipRect();
 }
 
 bool Toggle(UiContext& ctx, std::uint32_t id, ImVec2 pos, bool& value) {

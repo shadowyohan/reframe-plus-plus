@@ -1,9 +1,12 @@
 #include "rf/ui/Overlay.h"
 
+#include <algorithm>
+
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 
+#include "rf/capture/hook/HookProtocol.h"
 #include "rf/core/Log.h"
 #include "rf/core/Time.h"
 
@@ -233,15 +236,10 @@ void Overlay::Resize(UINT width, UINT height) {
 void Overlay::ApplyInputStyle() {
 
     LONG_PTR style = ::GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
-    if (interactive_) {
-        style &= ~static_cast<LONG_PTR>(WS_EX_NOACTIVATE);
-    } else {
-        style |= static_cast<LONG_PTR>(WS_EX_NOACTIVATE);
-    }
+    style |= static_cast<LONG_PTR>(WS_EX_NOACTIVATE);
     ::SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, style);
     ::SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
-                   SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED |
-                       (interactive_ ? 0 : SWP_NOACTIVATE));
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
 }
 
 void Overlay::SetShape(const std::vector<ImVec4>& rects) {
@@ -256,18 +254,30 @@ void Overlay::SetShape(const std::vector<ImVec4>& rects) {
     HRGN combined = ::CreateRectRgn(0, 0, 0, 0);
     for (const ImVec4& r : rects) {
 
-        HRGN piece = ::CreateRectRgn(static_cast<int>(r.x) - 2, static_cast<int>(r.y) - 2,
-                                     static_cast<int>(r.z) + 2, static_cast<int>(r.w) + 2);
+        HRGN piece = ::CreateRectRgn(static_cast<int>(r.x * ui_scale_) - 2,
+                                     static_cast<int>(r.y * ui_scale_) - 2,
+                                     static_cast<int>(r.z * ui_scale_) + 2,
+                                     static_cast<int>(r.w * ui_scale_) + 2);
         ::CombineRgn(combined, combined, piece, RGN_OR);
         ::DeleteObject(piece);
     }
     ::SetWindowRgn(hwnd_, combined, TRUE);
 }
 
+void Overlay::SetUiScale(float scale) {
+    const float wanted = std::clamp(scale, 0.5f, 2.0f);
+    if (wanted == ui_scale_) return;
+    ui_scale_ = wanted;
+
+    shape_.clear();
+}
+
 void Overlay::SetVisible(bool visible) {
     if (visible_ == visible) return;
     visible_ = visible;
     ::ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+
+    if (visible) input_settle_ = 2;
 }
 
 void Overlay::SetClickable(bool clickable) {
@@ -276,32 +286,19 @@ void Overlay::SetClickable(bool clickable) {
     if (!interactive_) ApplyInputStyle();
 }
 
+void Overlay::BringToTop() {
+    if (!hwnd_) return;
+    ::SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                       SWP_ASYNCWINDOWPOS);
+}
+
 void Overlay::SetInteractive(bool interactive) {
     if (interactive_ == interactive) return;
     interactive_ = interactive;
     ApplyInputStyle();
+    if (interactive) BringToTop();
 
-    if (interactive) {
-
-        const DWORD self = ::GetCurrentThreadId();
-        const HWND foreground_window = ::GetForegroundWindow();
-        DWORD foreground = ::GetWindowThreadProcessId(foreground_window, nullptr);
-
-        if (foreground && foreground != self) {
-            DWORD_PTR result = 0;
-            if (!::SendMessageTimeoutW(foreground_window, WM_NULL, 0, 0,
-                                       SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &result)) {
-                RF_WARN("foreground window is not responding - not attaching input to it");
-                foreground = 0;
-            }
-        }
-
-        if (foreground && foreground != self) ::AttachThreadInput(self, foreground, TRUE);
-        ::SetForegroundWindow(hwnd_);
-        ::SetActiveWindow(hwnd_);
-        ::SetFocus(hwnd_);
-        if (foreground && foreground != self) ::AttachThreadInput(self, foreground, FALSE);
-    }
     RF_DEBUG("overlay interactive = {}", interactive);
 }
 
@@ -333,11 +330,14 @@ UiContext* Overlay::BeginFrame() {
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
 
+    ImGui::GetIO().DisplaySize =
+        ImVec2(static_cast<float>(width_) / ui_scale_, static_cast<float>(height_) / ui_scale_);
+
     if (interactive_ || clickable_) {
         POINT cursor{};
         if (::GetCursorPos(&cursor) && ::ScreenToClient(hwnd_, &cursor))
-            ImGui::GetIO().AddMousePosEvent(static_cast<float>(cursor.x),
-                                            static_cast<float>(cursor.y));
+            ImGui::GetIO().AddMousePosEvent(static_cast<float>(cursor.x) / ui_scale_,
+                                            static_cast<float>(cursor.y) / ui_scale_);
     }
 
     ImGui::NewFrame();
@@ -352,17 +352,106 @@ UiContext* Overlay::BeginFrame() {
     ctx_.fonts = &fonts_;
     ctx_.dt = (dt > 0.0f && dt < 0.5f) ? dt : 1.0f / 60.0f;
     ctx_.dpi = dpi_scale_;
-    ctx_.mouse = io.MousePos;
-    ctx_.mouse_down = io.MouseDown[0];
-    ctx_.mouse_pressed = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-    ctx_.mouse_released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
-    ctx_.wheel = io.MouseWheel;
-    ctx_.interactive = interactive_ || clickable_;
+    if (external_mouse_) {
+
+        ctx_.mouse = ImVec2(external_pos_.x / ui_scale_, external_pos_.y / ui_scale_);
+        ctx_.mouse_down = external_down_;
+        ctx_.mouse_pressed = external_down_ && !external_down_prev_;
+        ctx_.mouse_released = !external_down_ && external_down_prev_;
+        ctx_.wheel = external_wheel_;
+        external_down_prev_ = external_down_;
+        external_wheel_ = 0.0f;
+    } else {
+        ctx_.mouse = io.MousePos;
+        ctx_.mouse_down = io.MouseDown[0];
+        ctx_.mouse_pressed = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        ctx_.mouse_released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
+        ctx_.wheel = io.MouseWheel;
+        external_down_prev_ = false;
+    }
+
+    ctx_.interactive = interactive_ || clickable_ || external_mouse_;
+    if (input_settle_ > 0) {
+        --input_settle_;
+        ctx_.mouse_down = false;
+        ctx_.mouse_pressed = false;
+        ctx_.mouse_released = false;
+        ctx_.wheel = 0.0f;
+    }
+
+    if (!ctx_.mouse_down && !ctx_.mouse_released) active_widget_ = 0;
+    ctx_.active_id = active_widget_;
     ctx_.alpha = 1.0f;
     return &ctx_;
 }
 
+Status Overlay::SetMirrorToSharedSurface(bool enabled) {
+    if (enabled == mirror_enabled_) return Status::Ok();
+
+    if (!enabled) {
+        shared_rtv_.Reset();
+        shared_texture_.Reset();
+        shared_handle_ = 0;
+        mirror_enabled_ = false;
+        return Status::Ok();
+    }
+
+    if (width_ == 0 || height_ == 0) return Status::Fail("overlay has no size yet");
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width_;
+    desc.Height = height_;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    RF_HR(device_->device()->CreateTexture2D(&desc, nullptr, &texture));
+    RF_HR(device_->device()->CreateRenderTargetView(texture.Get(), nullptr, &shared_rtv_));
+
+    Microsoft::WRL::ComPtr<IDXGIResource> resource;
+    RF_HR(texture.As(&resource));
+    HANDLE handle = nullptr;
+    RF_HR(resource->GetSharedHandle(&handle));
+
+    shared_texture_ = std::move(texture);
+    shared_handle_ = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(handle));
+    ++shared_serial_;
+    mirror_enabled_ = true;
+    RF_INFO("overlay mirror up: {}x{} handle 0x{:x}", width_, height_, shared_handle_);
+    return Status::Ok();
+}
+
+void Overlay::SetExternalMouse(bool active, ImVec2 pos, bool down, float wheel) {
+    external_mouse_ = active;
+    external_pos_ = pos;
+    external_down_ = down;
+    external_wheel_ += wheel;
+}
+
 void Overlay::EndFrame() {
+    active_widget_ = ctx_.active_id;
+
+    if (external_mouse_) {
+        const ImVec2 p = ImVec2(external_pos_.x / ui_scale_, external_pos_.y / ui_scale_);
+        const float s = external_down_ ? 0.9f : 1.0f;
+        const ImVec2 tip(p.x, p.y);
+        const ImVec2 tail(p.x + 11.0f * s, p.y + 15.0f * s);
+        const ImVec2 side(p.x + 2.5f * s, p.y + 17.0f * s);
+
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+        dl->AddTriangleFilled(ImVec2(tip.x - 1.5f, tip.y - 1.5f),
+                              ImVec2(tail.x + 1.5f, tail.y + 1.5f),
+                              ImVec2(side.x - 1.5f, side.y + 1.5f), IM_COL32(0, 0, 0, 190));
+        dl->AddTriangleFilled(tip, tail, side, IM_COL32(255, 255, 255, 255));
+    }
+
     ImGui::Render();
 
     constexpr float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -374,7 +463,17 @@ void Overlay::EndFrame() {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     }
 
-    const HRESULT presented = swap_chain_->Present(0, 0);
+    if (mirror_enabled_ && shared_rtv_) {
+        D3DDevice::ContextLock lock(*device_);
+        ID3D11RenderTargetView* mirror = shared_rtv_.Get();
+        device_->context()->OMSetRenderTargets(1, &mirror, nullptr);
+        device_->context()->ClearRenderTargetView(mirror, kClear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        device_->context()->Flush();
+    }
+
+    const HRESULT presented = swap_chain_->Present(1, 0);
     if (presented == DXGI_ERROR_DEVICE_REMOVED || presented == DXGI_ERROR_DEVICE_RESET) {
         RF_ERROR("Present reported the device is gone (0x{:08X})",
                  static_cast<unsigned>(presented));

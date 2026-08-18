@@ -1,6 +1,7 @@
 #include "rf/gpu/D3DDevice.h"
 
 #include "rf/core/Log.h"
+#include "rf/core/Strings.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -50,6 +51,18 @@ Status D3DDevice::Create(const AdapterInfo& adapter_info, std::shared_ptr<D3DDev
 
     out = std::move(self);
     return Status::Ok();
+}
+
+Status D3DDevice::CreateForLuid(std::int32_t luid_low, std::int32_t luid_high,
+                                std::shared_ptr<D3DDevice>& out) {
+    for (const AdapterInfo& info : EnumerateAdapters()) {
+        if (info.luid_low == luid_low && info.luid_high == luid_high && !info.is_software) {
+            RF_INFO("using the configured adapter: {}", ToUtf8(info.description));
+            return Create(info, out);
+        }
+    }
+    RF_WARN("the configured GPU is not present - falling back to automatic selection");
+    return CreateForOutput(nullptr, out);
 }
 
 Status D3DDevice::CreateForOutput(void* hwnd, std::shared_ptr<D3DDevice>& out) {

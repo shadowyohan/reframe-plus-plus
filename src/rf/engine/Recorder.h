@@ -6,10 +6,12 @@
 
 #include "rf/audio/AacEncoder.h"
 #include "rf/audio/WasapiCapture.h"
+#include "rf/capture/GameCapture.h"
 #include "rf/capture/GameWatcher.h"
 #include "rf/capture/IVideoCapture.h"
 #include "rf/encode/IVideoEncoder.h"
 #include "rf/engine/Settings.h"
+#include "rf/gpu/ColorConverter.h"
 #include "rf/mux/Mp4Muxer.h"
 #include "rf/replay/ReplayBuffer.h"
 
@@ -52,11 +54,28 @@ public:
     [[nodiscard]] Status_ GetStatus() const;
 
     [[nodiscard]] std::string target_app() const;
+
+    [[nodiscard]] bool capture_is_hooked() const;
+
+    Status SetCaptureMonitor(void* hmonitor);
+    [[nodiscard]] void* capture_monitor() const { return active_monitor_; }
+
+    void SetInGameOverlay(std::uint32_t handle, std::uint32_t serial, std::uint32_t width,
+                          std::uint32_t height, bool visible);
     [[nodiscard]] const Settings& settings() const { return settings_; }
+
+    [[nodiscard]] static bool PacerAccepts(Ticks100ns timestamp, Ticks100ns deadline,
+                                           Ticks100ns period) {
+        return timestamp + period / 2 >= deadline;
+    }
 
 private:
 
     Status ArmReplayLocked();
+    Status SetCaptureMonitorLocked(void* hmonitor);
+
+    Status StartDisplayCapture(const CaptureTarget& target, const FrameCallback& on_frame,
+                               VideoCapturePtr& out);
     void DisarmReplayLocked();
 
     void OnGameChanged(const GameWindow& game);
@@ -80,8 +99,15 @@ private:
 
     std::mutex pipeline_mutex_;
     GameWatcher game_watcher_;
+
+    void* active_monitor_ = nullptr;
+    ColorConverter scaler_;
+    std::uint32_t scaler_src_width_ = 0;
+    std::uint32_t scaler_src_height_ = 0;
     QuirkSet quirks_;
     VideoCapturePtr capture_;
+
+    std::unique_ptr<GameCapture> overlay_hook_;
     VideoEncoderPtr encoder_;
     std::unique_ptr<WasapiCapture> system_audio_;
     std::unique_ptr<WasapiCapture> microphone_;
@@ -91,6 +117,8 @@ private:
     std::unique_ptr<Mp4Muxer> muxer_;
 
     std::atomic<State> state_{State::Idle};
+
+    bool arm_requested_ = false;
     std::atomic<bool> encoder_ready_{false};
 
     std::mutex pace_mutex_;
@@ -107,9 +135,12 @@ private:
     Ticks100ns epoch_ = 0;
 
     std::unique_ptr<AacEncoder> aac_;
+
+    std::unique_ptr<AacEncoder> aac_mic_;
     std::mutex mic_mutex_;
     std::vector<float> mic_fifo_;
     std::vector<float> mix_scratch_;
+    std::vector<float> mic_scratch_;
     std::atomic<float> system_volume_{1.0f};
     std::atomic<float> mic_volume_{1.0f};
     VideoFormat video_format_{};

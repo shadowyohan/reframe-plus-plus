@@ -25,7 +25,7 @@ struct AppModel {
     std::uint64_t disk_used_bytes = 0;
     std::uint64_t disk_total_bytes = 0;
     std::string mic_device_label = "Системный по умолчанию";
-    std::string build_line = "reframe++ 1.0 © | Build: 471. All rights reserved";
+    std::string build_line = "reframe++ 1.1 © | Build: 512. All rights reserved";
 
     std::string record_hotkey = "ALT+F9";
     std::string replay_hotkey = "ALT+F10";
@@ -36,6 +36,19 @@ struct AppModel {
     };
     std::vector<MicOption> mic_devices;
     std::string mic_selected_id;
+
+    struct GpuOption {
+        std::string name;
+        std::int32_t luid_low = 0;
+        std::int32_t luid_high = 0;
+    };
+    std::vector<GpuOption> gpus;
+
+    struct MonitorOption {
+        std::string name;
+        std::string device_name;
+    };
+    std::vector<MonitorOption> monitors;
 
     std::function<void()> on_toggle_record;
     std::function<void(const std::string&)> on_pick_mic;
@@ -75,6 +88,8 @@ public:
 
     void OpenInPlayer(AppModel& model, const std::filesystem::path& file);
     void ClosePlayer(AppModel& model);
+
+    void ClosePlayer();
     [[nodiscard]] bool player_open() const { return player_open_; }
 
     [[nodiscard]] bool capturing_key() const { return capture_row_ >= 0; }
@@ -98,6 +113,8 @@ private:
     Page page_ = Page::Main;
     Page previous_page_ = Page::Main;
     bool mic_list_open_ = false;
+    bool gpu_list_open_ = false;
+    bool monitor_list_open_ = false;
 
     Spring slide_{-700.0f};
     Spring transition_{1.0f};
@@ -105,6 +122,12 @@ private:
     bool transitioning_ = false;
 
     ScrollArea scroll_;
+
+    ScrollArea page_scroll_;
+    float content_bottom_ = 0.0f;
+    float page_height_[7] = {};
+
+    VideoPlayer* player_ = nullptr;
 
     int capture_row_ = -1;
 

@@ -1,5 +1,7 @@
 #include "rf/gpu/ColorConverter.h"
 
+#include <cmath>
+
 #include "rf/core/Log.h"
 
 using Microsoft::WRL::ComPtr;
@@ -66,8 +68,12 @@ Status ColorConverter::Init(const D3DDevicePtr& device, std::uint32_t src_width,
     video_context_->VideoProcessorSetStreamColorSpace(processor_.Get(), 0, &in_cs);
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE out_cs = in_cs;
-    out_cs.RGB_Range = 1;
-    out_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    const bool rgb_out = dst_format_ == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                         dst_format_ == DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (!rgb_out) {
+        out_cs.RGB_Range = 1;
+        out_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    }
     video_context_->VideoProcessorSetOutputColorSpace(processor_.Get(), &out_cs);
 
     if (color == ColorSpace::Rec2020Pq) {
@@ -81,9 +87,55 @@ Status ColorConverter::Init(const D3DDevicePtr& device, std::uint32_t src_width,
                                                        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
     video_context_->VideoProcessorSetStreamAutoProcessingMode(processor_.Get(), 0, FALSE);
 
+    const double src_aspect = static_cast<double>(src_width_) / src_height_;
+    const double dst_aspect = static_cast<double>(dst_width_) / dst_height_;
+    if (std::abs(src_aspect - dst_aspect) > 0.001) {
+        RECT fitted{0, 0, static_cast<LONG>(dst_width_), static_cast<LONG>(dst_height_)};
+        if (src_aspect > dst_aspect) {
+            const LONG height = static_cast<LONG>(dst_width_ / src_aspect + 0.5);
+            fitted.top = (static_cast<LONG>(dst_height_) - height) / 2;
+            fitted.bottom = fitted.top + height;
+        } else {
+            const LONG width = static_cast<LONG>(dst_height_ * src_aspect + 0.5);
+            fitted.left = (static_cast<LONG>(dst_width_) - width) / 2;
+            fitted.right = fitted.left + width;
+        }
+
+        video_context_->VideoProcessorSetStreamDestRect(processor_.Get(), 0, TRUE, &fitted);
+
+        const D3D11_VIDEO_COLOR black{{0.0f, 0.0f, 0.0f, 1.0f}};
+        video_context_->VideoProcessorSetOutputBackgroundColor(processor_.Get(), FALSE, &black);
+
+        RF_INFO("letterboxing {}x{} into {}x{}: {},{} to {},{}", src_width_, src_height_,
+                dst_width_, dst_height_, fitted.left, fitted.top, fitted.right, fitted.bottom);
+    }
+
     RF_INFO("colour converter {}x{} fmt {} -> {}x{} fmt {} ({})", src_width_, src_height_,
             static_cast<int>(src_format_), dst_width_, dst_height_, static_cast<int>(dst_format_),
             ToString(color));
+    return Status::Ok();
+}
+
+Status ColorConverter::InputViewFor(ID3D11Texture2D* src, ID3D11VideoProcessorInputView** out) {
+    for (auto& [texture, view] : input_views_) {
+        if (texture == src && view) {
+            *out = view.Get();
+            return Status::Ok();
+        }
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+    ivd.FourCC = 0;
+    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ivd.Texture2D.MipSlice = 0;
+    ivd.Texture2D.ArraySlice = 0;
+
+    ComPtr<ID3D11VideoProcessorInputView> view;
+    RF_HR(video_device_->CreateVideoProcessorInputView(src, enumerator_.Get(), &ivd, &view));
+
+    input_views_[next_input_] = {src, view};
+    next_input_ = (next_input_ + 1) % kInputCacheSize;
+    *out = view.Get();
     return Status::Ok();
 }
 
@@ -95,18 +147,12 @@ Status ColorConverter::Convert(ID3D11Texture2D* src, ID3D11Texture2D** out) {
         return Status::Ok();
     }
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
-    ivd.FourCC = 0;
-    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ivd.Texture2D.MipSlice = 0;
-    ivd.Texture2D.ArraySlice = 0;
-
-    ComPtr<ID3D11VideoProcessorInputView> input_view;
-    RF_HR(video_device_->CreateVideoProcessorInputView(src, enumerator_.Get(), &ivd, &input_view));
+    ID3D11VideoProcessorInputView* input_view = nullptr;
+    RF_TRY(InputViewFor(src, &input_view));
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
-    stream.pInputSurface = input_view.Get();
+    stream.pInputSurface = input_view;
 
     const int slot = next_output_;
     next_output_ = (next_output_ + 1) % kPoolSize;

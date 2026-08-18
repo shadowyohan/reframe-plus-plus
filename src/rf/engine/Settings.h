@@ -8,11 +8,27 @@
 
 namespace rf {
 
+inline constexpr float kUiScaleMin = 0.5f;
+inline constexpr float kUiScaleMax = 2.0f;
+
 struct Settings {
 
     CaptureBackend capture_backend = CaptureBackend::Auto;
     bool capture_cursor = true;
     bool capture_focused_window_only = false;
+
+    std::int32_t gpu_luid_low = 0;
+    std::int32_t gpu_luid_high = 0;
+
+    [[nodiscard]] bool has_gpu_override() const { return gpu_luid_low || gpu_luid_high; }
+
+    std::string capture_monitor;
+
+    bool monitor_follow_cursor = false;
+
+    std::uint32_t monitor_switch_delay_ms = 3000;
+
+    float ui_scale = 1.0f;
     std::uint32_t fps = 60;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -20,7 +36,7 @@ struct Settings {
     EncoderBackend encoder_backend = EncoderBackend::Auto;
     Codec codec = Codec::H264;
     RateControl rate_control = RateControl::CBR;
-    std::uint32_t bitrate_kbps = 20'000;  // matches the default "Высокое"
+    std::uint32_t bitrate_kbps = 20'000;
     std::uint32_t keyframe_interval_ms = 2'000;
     bool hdr = false;
 
@@ -40,7 +56,9 @@ struct Settings {
     float mic_volume = 1.0f;
     float mic_gain = 1.0f;
     std::string mic_device;
+
     std::uint32_t audio_tracks = 0;
+    [[nodiscard]] bool separate_audio_tracks() const { return audio_tracks != 0; }
 
     bool disk_limit_enabled = true;
     std::uint32_t disk_limit_gb = 200;

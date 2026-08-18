@@ -68,7 +68,7 @@ QuirkSet DetectQuirks(const AdapterInfo& adapter) {
         case GpuVendor::Nvidia:
 
             Add(set, Quirk::Id::EncoderLimitAsyncDepth,
-                "cap NVENC in-flight frames at 4 to bound capture->encode latency");
+                "use the configured NVENC in-flight depth instead of the generic one");
             break;
 
         case GpuVendor::Amd:

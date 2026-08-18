@@ -40,6 +40,8 @@ struct CaptureTarget {
     void* hmonitor = nullptr;
     bool capture_cursor = true;
     bool show_capture_border = false;
+
+    std::uint32_t fps = 0;
 };
 
 struct CaptureStats {

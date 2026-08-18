@@ -16,7 +16,8 @@ public:
     ~Mp4Muxer();
 
     Status Open(const std::filesystem::path& file, const VideoFormat& video,
-                const CodecPrivate& codec_private, IMFMediaType* aac_type);
+                const CodecPrivate& codec_private, IMFMediaType* aac_type,
+                std::uint32_t audio_tracks = 1);
 
     Status WritePacket(const Packet& packet);
     Status Close();
@@ -26,8 +27,8 @@ public:
 private:
     Microsoft::WRL::ComPtr<IMFSinkWriter> writer_;
     DWORD video_stream_ = 0;
-    DWORD audio_stream_ = 0;
-    bool has_audio_ = false;
+    DWORD audio_stream_[2] = {};
+    std::uint32_t audio_tracks_ = 0;
     bool started_ = false;
     bool seen_keyframe_ = false;
 

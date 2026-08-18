@@ -34,6 +34,20 @@ struct AdapterInfo {
 
 std::vector<AdapterInfo> EnumerateAdapters();
 
+struct MonitorInfo {
+    std::wstring device_name;
+    std::wstring description;
+    void* handle = nullptr;
+    std::int32_t x = 0, y = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    bool primary = false;
+};
+
+std::vector<MonitorInfo> EnumerateMonitors();
+
+void* MonitorForDeviceName(const std::wstring& device_name);
+
 bool FindAdapterForOutput(void* hwnd, AdapterInfo& out);
 
 }

@@ -17,7 +17,7 @@ public:
     ~AacEncoder();
 
     Status Open(const AudioFormat& format, std::uint32_t bitrate_bps, Ticks100ns epoch,
-                const std::function<void(PacketPtr)>& on_packet);
+                const std::function<void(PacketPtr)>& on_packet, std::uint32_t track = 0);
     void Close();
 
     Status Feed(const float* interleaved, std::uint32_t frames, Ticks100ns timestamp);
@@ -33,6 +33,7 @@ private:
     std::vector<std::int16_t> convert_;
     AudioFormat format_{};
     Ticks100ns epoch_ = 0;
+    std::uint32_t track_ = 0;
     bool open_ = false;
 };
 

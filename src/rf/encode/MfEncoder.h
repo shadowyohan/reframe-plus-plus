@@ -56,6 +56,8 @@ private:
     std::atomic<int> need_input_{0};
     std::atomic<bool> force_keyframe_{false};
 
+    std::atomic<bool> draining_{false};
+
     std::mutex pending_mutex_;
     std::vector<Microsoft::WRL::ComPtr<IMFSample>> pending_;
 

@@ -1,5 +1,7 @@
 #include "rf/mux/Mp4Muxer.h"
 
+#include <algorithm>
+
 #include <mfapi.h>
 #include <mferror.h>
 
@@ -26,7 +28,8 @@ GUID SubtypeFor(Codec c) {
 Mp4Muxer::~Mp4Muxer() { Close(); }
 
 Status Mp4Muxer::Open(const std::filesystem::path& file, const VideoFormat& video,
-                      const CodecPrivate& codec_private, IMFMediaType* aac_type) {
+                      const CodecPrivate& codec_private, IMFMediaType* aac_type,
+                      std::uint32_t audio_tracks) {
     path_ = file;
     std::error_code ec;
     std::filesystem::create_directories(file.parent_path(), ec);
@@ -57,9 +60,11 @@ Status Mp4Muxer::Open(const std::filesystem::path& file, const VideoFormat& vide
     RF_HR(writer_->SetInputMediaType(video_stream_, video_type.Get(), nullptr));
 
     if (aac_type) {
-        RF_HR(writer_->AddStream(aac_type, &audio_stream_));
-        RF_HR(writer_->SetInputMediaType(audio_stream_, aac_type, nullptr));
-        has_audio_ = true;
+        audio_tracks_ = std::min<std::uint32_t>(std::max<std::uint32_t>(audio_tracks, 1), 2);
+        for (std::uint32_t i = 0; i < audio_tracks_; ++i) {
+            RF_HR(writer_->AddStream(aac_type, &audio_stream_[i]));
+            RF_HR(writer_->SetInputMediaType(audio_stream_[i], aac_type, nullptr));
+        }
     }
 
     RF_HR(writer_->BeginWriting());
@@ -96,8 +101,11 @@ Status Mp4Muxer::WritePacket(const Packet& packet) {
     RF_HR(sample->SetSampleDuration(packet.duration));
     if (packet.keyframe) RF_HR(sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE));
 
-    const DWORD stream = packet.kind == MediaKind::Video ? video_stream_ : audio_stream_;
-    if (packet.kind == MediaKind::Audio && !has_audio_) return Status::Ok();
+    if (packet.kind == MediaKind::Audio && audio_tracks_ == 0) return Status::Ok();
+
+    const std::uint32_t track = packet.track < audio_tracks_ ? packet.track : 0;
+    const DWORD stream =
+        packet.kind == MediaKind::Video ? video_stream_ : audio_stream_[track];
 
     RF_HR(writer_->WriteSample(stream, sample.Get()));
     bytes_written_ += packet.data.size();

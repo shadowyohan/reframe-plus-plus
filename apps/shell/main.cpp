@@ -9,6 +9,7 @@
 
 #include <share.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -37,6 +38,8 @@ namespace {
 constexpr int kHotkeyOverlay = 1;
 constexpr int kHotkeyRecord = 2;
 constexpr int kHotkeyReplay = 3;
+
+constexpr int kHotkeyEscape = 4;
 
 constexpr UINT WM_RF_TRAY = WM_APP + 1;
 constexpr UINT kMenuOpen = 100;
@@ -179,11 +182,16 @@ struct App {
     rf::Ticks100ns settings_touched = 0;
     bool settings_dirty = false;
 
+    std::int32_t applied_gpu_luid_low = 0;
+    std::int32_t applied_gpu_luid_high = 0;
+
     bool replay_target = false;
     rf::Ticks100ns replay_touched = 0;
     bool replay_pending = false;
 
     rf::Ticks100ns gallery_polled = 0;
+
+    std::atomic<void*> refused_monitor{nullptr};
 
     std::thread engine;
     std::mutex task_mutex;
@@ -286,6 +294,129 @@ void SettingsTouched() {
     g_app->settings_touched = rf::Now100ns();
 }
 
+HHOOK g_key_hook = nullptr;
+
+HHOOK g_mouse_hook = nullptr;
+std::atomic<int> g_mouse_x{0};
+std::atomic<int> g_mouse_y{0};
+
+POINT g_mouse_origin{};
+std::atomic<bool> g_mouse_down{false};
+std::atomic<int> g_mouse_wheel{0};
+
+LRESULT CALLBACK MouseCaptureProc(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HC_ACTION) {
+        const auto* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lparam);
+        switch (wparam) {
+            case WM_MOUSEMOVE: {
+
+                const int dx = ms->pt.x - g_mouse_origin.x;
+                const int dy = ms->pt.y - g_mouse_origin.y;
+                const int w = ::GetSystemMetrics(SM_CXSCREEN);
+                const int h = ::GetSystemMetrics(SM_CYSCREEN);
+                g_mouse_x.store(std::clamp(g_mouse_x.load(std::memory_order_relaxed) + dx, 0, w - 1),
+                                std::memory_order_relaxed);
+                g_mouse_y.store(std::clamp(g_mouse_y.load(std::memory_order_relaxed) + dy, 0, h - 1),
+                                std::memory_order_relaxed);
+                return 1;
+            }
+            case WM_LBUTTONDOWN:
+                g_mouse_down.store(true, std::memory_order_relaxed);
+                return 1;
+            case WM_LBUTTONUP:
+                g_mouse_down.store(false, std::memory_order_relaxed);
+                return 1;
+            case WM_MOUSEWHEEL:
+                g_mouse_wheel.fetch_add(GET_WHEEL_DELTA_WPARAM(ms->mouseData) / WHEEL_DELTA,
+                                        std::memory_order_relaxed);
+                return 1;
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP:
+
+                return 1;
+            default:
+                break;
+        }
+    }
+    return ::CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+}
+
+void SetMouseCaptureHook(bool wanted) {
+    if (wanted == (g_mouse_hook != nullptr)) return;
+    if (wanted) {
+
+        POINT p{};
+        if (::GetCursorPos(&p)) {
+            g_mouse_origin = p;
+            g_mouse_x.store(p.x, std::memory_order_relaxed);
+            g_mouse_y.store(p.y, std::memory_order_relaxed);
+        }
+        g_mouse_down.store(false, std::memory_order_relaxed);
+        g_mouse_hook = ::SetWindowsHookExW(WH_MOUSE_LL, MouseCaptureProc, nullptr, 0);
+        if (!g_mouse_hook) RF_WARN("could not install the mouse hook for the in-game menu");
+    } else {
+        ::UnhookWindowsHookEx(g_mouse_hook);
+        g_mouse_hook = nullptr;
+    }
+}
+
+bool IsModifierKey(DWORD vk) {
+    return vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT || vk == VK_LCONTROL ||
+           vk == VK_RCONTROL || vk == VK_LMENU || vk == VK_RMENU || vk == VK_LSHIFT ||
+           vk == VK_RSHIFT || vk == VK_LWIN || vk == VK_RWIN;
+}
+
+LRESULT CALLBACK KeyCaptureProc(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HC_ACTION && (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN) && g_app) {
+        const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lparam);
+
+        if (IsModifierKey(kb->vkCode)) return ::CallNextHookEx(g_key_hook, code, wparam, lparam);
+
+        std::uint32_t mods = 0;
+        if (::GetAsyncKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
+        if (::GetAsyncKeyState(VK_MENU) < 0) mods |= MOD_ALT;
+        if (::GetAsyncKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
+
+        g_app->model.pending_vk = kb->vkCode;
+        g_app->model.pending_mods = mods;
+        return 1;
+    }
+    return ::CallNextHookEx(g_key_hook, code, wparam, lparam);
+}
+
+void SetKeyCaptureHook(bool wanted) {
+    if (wanted == (g_key_hook != nullptr)) return;
+    if (wanted) {
+        g_key_hook = ::SetWindowsHookExW(WH_KEYBOARD_LL, KeyCaptureProc, nullptr, 0);
+        if (!g_key_hook) RF_WARN("could not install the keyboard hook for rebinding");
+    } else {
+        ::UnhookWindowsHookEx(g_key_hook);
+        g_key_hook = nullptr;
+    }
+}
+
+void RestartRecorder() {
+    PostEngine([] {
+        App& app = *g_app;
+        const bool was_armed = app.recorder.state() != rf::Recorder::State::Idle;
+        if (app.recorder.state() == rf::Recorder::State::Recording) app.recorder.StopRecording();
+        app.recorder.Shutdown();
+
+        if (auto s = app.recorder.Init(app.settings); !s.ok()) {
+            RF_ERROR("restarting the recorder failed: {}", s.str());
+            app.hud.Push(rf::ui::Hud::Kind::Error, "Не удалось переключить видеокарту");
+            return;
+        }
+        if (was_armed && app.settings.replay_enabled) {
+            if (auto s = app.recorder.ArmReplay(); !s.ok())
+                RF_ERROR("re-arm after the GPU change: {}", s.str());
+        }
+        RF_INFO("recorder restarted on the selected GPU");
+    });
+}
+
 void FlushSettings() {
     App& app = *g_app;
     if (!app.settings_dirty) return;
@@ -294,6 +425,15 @@ void FlushSettings() {
     app.settings_dirty = false;
     app.settings.Save(rf::paths::SettingsFile());
     app.gallery.SetDirectory(app.settings.output_dir);
+
+    if (app.settings.gpu_luid_low != app.applied_gpu_luid_low ||
+        app.settings.gpu_luid_high != app.applied_gpu_luid_high) {
+        app.applied_gpu_luid_low = app.settings.gpu_luid_low;
+        app.applied_gpu_luid_high = app.settings.gpu_luid_high;
+        RF_INFO("capture GPU changed - restarting the recorder");
+        RestartRecorder();
+        return;
+    }
 
     const rf::Settings snapshot = app.settings;
     PostEngine([snapshot] {
@@ -310,6 +450,57 @@ void RefreshMicDevices() {
     for (const auto& mic : EnumerateMics())
         app.model.mic_devices.push_back({mic.id, mic.name});
     app.model.mic_selected_id = app.settings.mic_device;
+}
+
+void FollowCursorAcrossMonitors() {
+    App& app = *g_app;
+    if (!app.settings.monitor_follow_cursor || app.settings.capture_focused_window_only) return;
+    if (app.recorder.state() == rf::Recorder::State::Idle) return;
+
+    POINT cursor{};
+    if (!::GetCursorPos(&cursor)) return;
+
+    HMONITOR under = ::MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    static HMONITOR watched = nullptr;
+    static rf::Ticks100ns since = 0;
+
+    if (under != watched) {
+        watched = under;
+        since = rf::Now100ns();
+        return;
+    }
+    if (under == app.recorder.capture_monitor()) return;
+
+    const rf::Ticks100ns dwell = rf::MsTo100ns(app.settings.monitor_switch_delay_ms);
+    if (rf::Now100ns() - since < dwell) return;
+
+    static HMONITOR refused = nullptr;
+    if (under == refused) return;
+
+    since = rf::Now100ns();
+    PostEngine([under] {
+        if (auto s = g_app->recorder.SetCaptureMonitor(under); !s.ok()) {
+            RF_WARN("could not follow the cursor to the other display: {} - not trying it again",
+                    s.str());
+            g_app->refused_monitor.store(under, std::memory_order_relaxed);
+        }
+    });
+    if (void* denied = app.refused_monitor.exchange(nullptr, std::memory_order_relaxed))
+        refused = static_cast<HMONITOR>(denied);
+}
+
+void RefreshMonitors() {
+    App& app = *g_app;
+    app.model.monitors.clear();
+    const auto monitors = rf::EnumerateMonitors();
+    for (std::size_t i = 0; i < monitors.size(); ++i) {
+        const rf::MonitorInfo& m = monitors[i];
+
+        app.model.monitors.push_back(
+            {std::format("{}. {} - {}x{}{}", i + 1, rf::ToUtf8(m.description), m.width, m.height,
+                         m.primary ? " (основной)" : ""),
+             rf::ToUtf8(m.device_name)});
+    }
 }
 
 void PickMicDevice(const std::string& id) {
@@ -462,6 +653,12 @@ void OnHotkey(int id) {
         case kHotkeyOverlay: g_app->menu.ToggleOpen(); break;
         case kHotkeyRecord:  ToggleRecording(); break;
         case kHotkeyReplay:  SaveReplay(); break;
+        case kHotkeyEscape:
+            if (g_app->menu.player_open())
+                g_app->menu.ClosePlayer(g_app->model);
+            else if (g_app->menu.open())
+                g_app->menu.Close();
+            break;
         default: break;
     }
 }
@@ -534,6 +731,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         ::MessageBoxW(nullptr, rf::ToWide(s.str()).c_str(), L"reframe++", MB_ICONERROR);
         return 1;
     }
+
+    app.applied_gpu_luid_low = app.settings.gpu_luid_low;
+    app.applied_gpu_luid_high = app.settings.gpu_luid_high;
 
     app.gallery.Start(app.settings.output_dir);
 
@@ -640,6 +840,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return true;
     };
 
+    app.model.gpus.push_back({"Авто", 0, 0});
+    for (const rf::AdapterInfo& info : rf::EnumerateAdapters()) {
+        if (info.is_software) continue;
+        app.model.gpus.push_back(
+            {rf::ToUtf8(info.description), info.luid_low, info.luid_high});
+    }
+
+    RefreshMonitors();
+
     app.model.record_hotkey = rf::ui::DescribeHotkey(app.settings.hotkey_toggle_record_mods,
                                                      app.settings.hotkey_toggle_record_vk);
     app.model.replay_hotkey = rf::ui::DescribeHotkey(app.settings.hotkey_save_replay_mods,
@@ -667,6 +876,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     if (app.settings.replay_enabled) SetReplayArmed(true);
 
+    RF_INFO("reframe++ 1.1.0 build 512, compiled {} {}", __DATE__, __TIME__);
     RF_INFO("reframe++ ready - Alt+Z opens the overlay");
 
     app.watchdog = std::thread(WatchdogLoop);
@@ -709,13 +919,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                 app.model.display_hz = static_cast<double>(timing.rateRefresh.uiNumerator) /
                                        timing.rateRefresh.uiDenominator;
 
-                if (app.settings.ClampFpsToDisplay(app.model.display_hz)) {
+                static double recent_hz[3] = {0.0, 0.0, 0.0};
+                static int recent_index = 0;
+                recent_hz[recent_index] = app.model.display_hz;
+                recent_index = (recent_index + 1) % 3;
+                const double peak_hz = std::max({recent_hz[0], recent_hz[1], recent_hz[2]});
+
+                if (app.settings.ClampFpsToDisplay(peak_hz)) {
                     RF_INFO("frame rate lowered to {} - the display runs at {:.0f} Hz",
-                            app.settings.ResolvedFps(), app.model.display_hz);
+                            app.settings.ResolvedFps(), peak_hz);
                     app.settings_dirty = true;
                 }
             }
         }
+
+        FollowCursorAcrossMonitors();
 
         app.hud.SetRecording(recording && !app.menu.open(), app.model.recording_seconds,
                              app.recorder.target_app());
@@ -738,19 +956,63 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
 
         static bool was_menu_open = false;
-        if (app.menu.open() && !was_menu_open) RefreshMicDevices();
+        if (app.menu.open() && !was_menu_open) {
+            RefreshMicDevices();
+            RefreshMonitors();
+        }
         was_menu_open = app.menu.open();
 
         app.stage = "window-style";
-        app.overlay.SetInteractive(app.menu.open());
+
+        const bool drawn_in_game = app.recorder.capture_is_hooked();
+        app.overlay.SetInteractive(app.menu.open() && !drawn_in_game);
+
+        static bool escape_registered = false;
+        if (app.menu.open() != escape_registered) {
+            escape_registered = app.menu.open();
+            if (escape_registered)
+                ::RegisterHotKey(app.overlay.hwnd(), kHotkeyEscape, MOD_NOREPEAT, VK_ESCAPE);
+            else
+                ::UnregisterHotKey(app.overlay.hwnd(), kHotkeyEscape);
+        }
+
+        SetKeyCaptureHook(app.menu.capturing_key());
+
+        const bool in_game_menu = drawn_in_game && app.menu.open();
+        SetMouseCaptureHook(in_game_menu);
+        app.overlay.SetExternalMouse(
+            in_game_menu,
+            ImVec2(static_cast<float>(g_mouse_x.load(std::memory_order_relaxed)),
+                   static_cast<float>(g_mouse_y.load(std::memory_order_relaxed))),
+            g_mouse_down.load(std::memory_order_relaxed),
+            static_cast<float>(g_mouse_wheel.exchange(0, std::memory_order_relaxed)));
+
+        const bool want_mirror = app.recorder.capture_is_hooked();
+        if (auto s = app.overlay.SetMirrorToSharedSurface(want_mirror); !s.ok())
+            RF_WARN("overlay mirror: {}", s.str());
+        if (want_mirror) {
+            app.recorder.SetInGameOverlay(app.overlay.shared_surface_handle(),
+                                          app.overlay.shared_surface_serial(),
+                                          app.overlay.width(), app.overlay.height(),
+                                          app.menu.visible() || app.hud.busy());
+        }
+
+        static rf::Ticks100ns last_raise = 0;
+        if ((app.menu.visible() || app.hud.busy()) &&
+            rf::Now100ns() - last_raise > rf::MsTo100ns(250)) {
+            last_raise = rf::Now100ns();
+            app.overlay.BringToTop();
+        }
 
         bool over_pill = false;
         if (!app.menu.open() && recording) {
             POINT cursor{};
+
+            const float scale = app.overlay.ui_scale();
             const ImVec4 r = app.hud.pill_rect();
             if (r.z > r.x && ::GetCursorPos(&cursor))
-                over_pill = cursor.x >= r.x - 4 && cursor.x <= r.z + 4 && cursor.y >= r.y - 4 &&
-                            cursor.y <= r.w + 4;
+                over_pill = cursor.x >= r.x * scale - 4 && cursor.x <= r.z * scale + 4 &&
+                            cursor.y >= r.y * scale - 4 && cursor.y <= r.w * scale + 4;
         }
         app.overlay.SetClickable(over_pill);
 
@@ -763,16 +1025,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             continue;
         }
 
+        app.overlay.SetUiScale(app.settings.ui_scale);
+
         app.stage = "render";
         if (rf::ui::UiContext* ctx = app.overlay.BeginFrame()) {
-            const ImVec2 screen = app.overlay.size();
+            const ImVec2 screen = app.overlay.design_size();
             app.menu.Draw(*ctx, screen, app.model, app.overlay.textures());
             app.hud.Draw(*ctx, screen, app.overlay.textures());
             app.stage = "present";
             app.overlay.EndFrame();
 
             app.stage = "shape";
-            if (app.menu.visible())
+            if (app.menu.visible() && !drawn_in_game)
                 app.overlay.SetShape({});
             else
                 app.overlay.SetShape(app.hud.hit_rects());
@@ -788,7 +1052,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (app.overlay.device_lost() || (app.recorder.device() && !app.recorder.device()->alive()))
             RecoverFromDeviceLoss();
 
-        ::Sleep(app.menu.open() ? 8 : 16);
+        ::Sleep(4);
     }
 
     RF_INFO("shutting down (quit={}, pump alive={})", app.quit, app.overlay.hwnd() != nullptr);

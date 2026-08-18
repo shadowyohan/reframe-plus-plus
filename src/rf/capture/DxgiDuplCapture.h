@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "rf/capture/IVideoCapture.h"
+#include "rf/gpu/CursorPainter.h"
 
 namespace rf {
 
@@ -32,6 +33,11 @@ private:
 
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dupl_;
     Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
+
+    CursorPainter cursor_;
+    bool cursor_ready_ = false;
+    std::int32_t desktop_x_ = 0;
+    std::int32_t desktop_y_ = 0;
 
     std::thread thread_;
     std::atomic<bool> running_{false};

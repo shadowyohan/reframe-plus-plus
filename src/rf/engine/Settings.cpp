@@ -115,12 +115,14 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.capture_cursor = GetBool(m, "capture_cursor", s.capture_cursor);
     s.capture_focused_window_only =
         GetBool(m, "capture_focused_window_only", s.capture_focused_window_only);
+    s.gpu_luid_low = static_cast<std::int32_t>(GetU32(m, "gpu_luid_low", 0));
+    s.gpu_luid_high = static_cast<std::int32_t>(GetU32(m, "gpu_luid_high", 0));
     s.hdr = GetBool(m, "hdr", s.hdr);
     s.replay_enabled = GetBool(m, "replay_enabled", s.replay_enabled);
     s.replay_seconds = GetU32(m, "replay_seconds", s.replay_seconds);
 
-    s.replay_max_memory_mb = std::max(GetU32(m, "replay_max_memory_mb", s.replay_max_memory_mb),
-                                      s.replay_max_memory_mb);
+    s.replay_max_memory_mb =
+        std::max(GetU32(m, "replay_max_memory_mb", s.replay_max_memory_mb), 256u);
     s.record_system_audio = GetBool(m, "record_system_audio", s.record_system_audio);
     s.record_microphone = GetBool(m, "record_microphone", s.record_microphone);
     s.audio_bitrate_kbps = GetU32(m, "audio_bitrate_kbps", s.audio_bitrate_kbps);
@@ -148,6 +150,12 @@ Settings Settings::Load(const std::filesystem::path& file) {
     if (const auto it = m.find("temp_dir"); it != m.end() && !it->second.empty())
         s.temp_dir = ToWide(it->second);
     if (const auto it = m.find("mic_device"); it != m.end()) s.mic_device = it->second;
+    if (const auto it = m.find("capture_monitor"); it != m.end()) s.capture_monitor = it->second;
+    s.monitor_follow_cursor = GetBool(m, "monitor_follow_cursor", s.monitor_follow_cursor);
+    s.monitor_switch_delay_ms =
+        std::min(GetU32(m, "monitor_switch_delay_ms", s.monitor_switch_delay_ms), 10'000u);
+    s.ui_scale = std::clamp(static_cast<float>(GetU32(m, "ui_scale_pct", 100)) / 100.0f,
+                            kUiScaleMin, kUiScaleMax);
     if (const auto it = m.find("filename_pattern"); it != m.end()) s.filename_pattern = it->second;
 
     return s;
@@ -175,6 +183,8 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "capture_cursor=" << (capture_cursor ? 1 : 0) << "\n";
 
     out << "capture_focused_window_only=" << (capture_focused_window_only ? 1 : 0) << "\n";
+    out << "gpu_luid_low=" << static_cast<std::uint32_t>(gpu_luid_low) << "\n";
+    out << "gpu_luid_high=" << static_cast<std::uint32_t>(gpu_luid_high) << "\n";
     out << "hdr=" << (hdr ? 1 : 0) << "\n";
     out << "replay_enabled=" << (replay_enabled ? 1 : 0) << "\n";
     out << "replay_seconds=" << replay_seconds << "\n";
@@ -190,6 +200,10 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "mic_volume_pct=" << static_cast<int>(mic_volume * 100.0f + 0.5f) << "\n";
     out << "mic_gain_pct=" << static_cast<int>(mic_gain * 100.0f + 0.5f) << "\n";
     out << "mic_device=" << mic_device << "\n";
+    out << "capture_monitor=" << capture_monitor << "\n";
+    out << "monitor_follow_cursor=" << (monitor_follow_cursor ? 1 : 0) << "\n";
+    out << "monitor_switch_delay_ms=" << monitor_switch_delay_ms << "\n";
+    out << "ui_scale_pct=" << static_cast<std::uint32_t>(ui_scale * 100.0f + 0.5f) << "\n";
     out << "disk_limit_enabled=" << (disk_limit_enabled ? 1 : 0) << "\n";
     out << "disk_limit_gb=" << disk_limit_gb << "\n";
     out << "output_dir=" << ToUtf8(output_dir.wstring()) << "\n";

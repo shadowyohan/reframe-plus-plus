@@ -89,21 +89,48 @@ Status MfEncoder::SelectTransform() {
                             "no hardware video encoder MFT for the requested codec");
     }
 
+    const std::wstring wanted_vendor = [&] -> std::wstring {
+        switch (device_ ? device_->info().vendor : GpuVendor::Unknown) {
+            case GpuVendor::Nvidia: return L"VEN_10DE";
+            case GpuVendor::Amd:    return L"VEN_1002";
+            case GpuVendor::Intel:  return L"VEN_8086";
+            default:                return L"";
+        }
+    }();
+
+    auto vendor_of = [](IMFActivate* activate) -> std::wstring {
+        LPWSTR id = nullptr;
+        UINT32 len = 0;
+        if (FAILED(activate->GetAllocatedString(MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, &id, &len)) ||
+            !id)
+            return {};
+        std::wstring out = id;
+        ::CoTaskMemFree(id);
+        return out;
+    };
+
     Status result = Status::Fail("no MFT could be activated");
-    for (UINT32 i = 0; i < count; ++i) {
-        ComPtr<IMFTransform> candidate;
-        if (SUCCEEDED(activates[i]->ActivateObject(IID_PPV_ARGS(&candidate)))) {
-            LPWSTR friendly = nullptr;
-            UINT32 len = 0;
-            if (SUCCEEDED(activates[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &friendly,
-                                                           &len)) &&
-                friendly) {
-                name_ = ToUtf8(friendly);
-                ::CoTaskMemFree(friendly);
+    for (int pass = 0; pass < 2 && !result.ok(); ++pass) {
+
+        const bool vendor_must_match = pass == 0 && !wanted_vendor.empty();
+
+        for (UINT32 i = 0; i < count; ++i) {
+            if (vendor_must_match && vendor_of(activates[i]) != wanted_vendor) continue;
+
+            ComPtr<IMFTransform> candidate;
+            if (SUCCEEDED(activates[i]->ActivateObject(IID_PPV_ARGS(&candidate)))) {
+                LPWSTR friendly = nullptr;
+                UINT32 len = 0;
+                if (SUCCEEDED(activates[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
+                                                               &friendly, &len)) &&
+                    friendly) {
+                    name_ = ToUtf8(friendly);
+                    ::CoTaskMemFree(friendly);
+                }
+                transform_ = std::move(candidate);
+                result = Status::Ok();
+                break;
             }
-            transform_ = std::move(candidate);
-            result = Status::Ok();
-            break;
         }
     }
 
@@ -307,7 +334,12 @@ void MfEncoder::EventLoop() {
                 if (auto s = DrainOutput(); !s.ok()) RF_WARN("ProcessOutput: {}", s.str());
                 break;
             case METransformDrainComplete:
-                RF_DEBUG("encoder drain complete");
+
+                RF_DEBUG("encoder drain complete - restarting the stream");
+                transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+                need_input_.store(0, std::memory_order_relaxed);
+                draining_.store(false, std::memory_order_release);
                 break;
             default:
                 break;
@@ -316,6 +348,9 @@ void MfEncoder::EventLoop() {
 }
 
 Status MfEncoder::FeedSample(IMFSample* sample) {
+
+    if (draining_.load(std::memory_order_acquire)) return Status::Ok();
+
     if (force_keyframe_.exchange(false)) {
         sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
         TrySetCodecApi(transform_.Get(), CODECAPI_AVEncVideoForceKeyFrame, VarU32(1));
@@ -450,6 +485,7 @@ Status MfEncoder::RequestKeyframe() {
 
 Status MfEncoder::Flush() {
     if (!transform_) return Status::Ok();
+    draining_.store(true, std::memory_order_release);
     RF_HR(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0));
     return Status::Ok();
 }

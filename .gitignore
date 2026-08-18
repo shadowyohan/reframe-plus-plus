@@ -67,3 +67,4 @@ docs/
 Thumbs.db
 desktop.ini
 .DS_Store
+/graphify-out

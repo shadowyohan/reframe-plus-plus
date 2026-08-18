@@ -1,6 +1,8 @@
 #include "rf/capture/GameCapture.h"
 
 #include <psapi.h>
+
+#include <algorithm>
 #include <tlhelp32.h>
 
 #include <filesystem>
@@ -111,11 +113,26 @@ Status HookDllPath(std::wstring& out_path) {
     return Status::Ok();
 }
 
+bool AlreadyInjected(HANDLE process) {
+    HMODULE modules[1024];
+    DWORD needed = 0;
+    if (!::EnumProcessModulesEx(process, modules, sizeof(modules), &needed, LIST_MODULES_64BIT))
+        return false;
+
+    const DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), std::size(modules));
+    for (DWORD i = 0; i < count; ++i) {
+        wchar_t name[MAX_PATH]{};
+        if (!::GetModuleBaseNameW(process, modules[i], name, MAX_PATH)) continue;
+        if (_wcsicmp(name, L"reframe-hook64.dll") == 0) return true;
+    }
+    return false;
+}
+
 Status InjectHook(std::uint32_t pid, const std::wstring& dll_path) {
     EnableDebugPrivilege();
 
     const DWORD access = PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
-                         PROCESS_VM_WRITE | PROCESS_VM_READ;
+                         PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION;
     HANDLE process = ::OpenProcess(access, FALSE, pid);
     if (!process) {
         const DWORD err = ::GetLastError();
@@ -131,6 +148,12 @@ Status InjectHook(std::uint32_t pid, const std::wstring& dll_path) {
         return Status::Fail("32-битные процессы пока не поддерживаются игровым захватом");
     }
 
+    if (AlreadyInjected(process)) {
+        ::CloseHandle(process);
+        RF_DEBUG("hook already present in pid {} - not loading it twice", pid);
+        return Status::Ok();
+    }
+
     Status s = RemoteLoadLibrary(process, dll_path);
     ::CloseHandle(process);
     return s;
@@ -140,9 +163,7 @@ GameCapture::GameCapture(D3DDevicePtr device) : device_(std::move(device)) {}
 
 GameCapture::~GameCapture() { Stop(); }
 
-Status GameCapture::Start(const CaptureTarget& target, const FrameCallback& on_frame) {
-    Stop();
-
+Status GameCapture::Attach(const CaptureTarget& target) {
     HWND wnd = target.hwnd ? static_cast<HWND>(target.hwnd) : ::GetForegroundWindow();
     pid_ = GameProcessForWindow(wnd);
     if (!pid_) return Status::Fail("нет подходящего окна на переднем плане");
@@ -171,6 +192,13 @@ Status GameCapture::Start(const CaptureTarget& target, const FrameCallback& on_f
     state_->capture = 1;
     state_->host_pid = ::GetCurrentProcessId();
 
+    if (target.fps > 0) {
+        LARGE_INTEGER freq{};
+        ::QueryPerformanceFrequency(&freq);
+        state_->capture_period_qpc =
+            static_cast<std::uint64_t>(freq.QuadPart) * 9 / (target.fps * 10);
+    }
+
     frame_event_ = ::CreateEventW(nullptr, FALSE, FALSE, names.frame);
     ready_event_ = ::CreateEventW(nullptr, TRUE, FALSE, names.ready);
     if (!frame_event_ || !ready_event_) {
@@ -187,6 +215,14 @@ Status GameCapture::Start(const CaptureTarget& target, const FrameCallback& on_f
         ReleaseIpc();
         return Status::Fail("приложение не ответило на внедрение (античит?)");
     }
+
+    attached_ = true;
+    return Status::Ok();
+}
+
+Status GameCapture::Start(const CaptureTarget& target, const FrameCallback& on_frame) {
+    Stop();
+    RF_TRY(Attach(target));
 
     const Ticks100ns deadline = Now100ns() + kOneSecond100ns * 3 / 2;
     while (state_->width == 0 || state_->height == 0) {
@@ -210,18 +246,28 @@ Status GameCapture::Start(const CaptureTarget& target, const FrameCallback& on_f
 }
 
 void GameCapture::Stop() {
+    attached_ = false;
 
     running_.store(false, std::memory_order_release);
     if (state_) state_->stop = 1;
     if (frame_event_) ::SetEvent(frame_event_);
     if (reader_.joinable()) reader_.join();
 
-    shared_mutex_.Reset();
-    shared_.Reset();
+    for (auto& slot : shared_) slot.Reset();
     staging_.Reset();
     bound_serial_ = 0;
     width_ = height_ = 0;
     ReleaseIpc();
+}
+
+void GameCapture::SetOverlay(std::uint32_t handle, std::uint32_t serial, std::uint32_t width,
+                             std::uint32_t height, bool visible) {
+    if (!state_) return;
+    state_->overlay_handle = handle;
+    state_->overlay_serial = serial;
+    state_->overlay_width = width;
+    state_->overlay_height = height;
+    state_->overlay_visible = visible ? 1u : 0u;
 }
 
 void GameCapture::ReleaseIpc() {
@@ -234,22 +280,23 @@ void GameCapture::ReleaseIpc() {
 }
 
 bool GameCapture::RebindSharedTexture() {
-    shared_mutex_.Reset();
-    shared_.Reset();
+    for (auto& slot : shared_) slot.Reset();
     staging_.Reset();
 
-    const HANDLE handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(state_->shared_handle));
-    if (!handle) return false;
+    for (std::uint32_t i = 0; i < hook::kSlots; ++i) {
+        const HANDLE handle =
+            reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(state_->shared_handle[i]));
+        if (!handle) return false;
 
-    HRESULT hr = device_->device()->OpenSharedResource(handle, IID_PPV_ARGS(&shared_));
-    if (FAILED(hr)) {
-        RF_WARN("game capture: OpenSharedResource failed: 0x{:08x}", static_cast<unsigned>(hr));
-        return false;
+        if (HRESULT hr = device_->device()->OpenSharedResource(handle, IID_PPV_ARGS(&shared_[i]));
+            FAILED(hr)) {
+            RF_WARN("game capture: OpenSharedResource failed: 0x{:08x}", static_cast<unsigned>(hr));
+            return false;
+        }
     }
-    if (FAILED(shared_.As(&shared_mutex_))) return false;
 
     D3D11_TEXTURE2D_DESC desc{};
-    shared_->GetDesc(&desc);
+    shared_[0]->GetDesc(&desc);
 
     D3D11_TEXTURE2D_DESC own = desc;
     own.MiscFlags = 0;
@@ -297,13 +344,13 @@ void GameCapture::ReaderLoop() {
         const std::uint64_t index = state_->frame_index;
         if (index == last_frame_index_) continue;
         const std::int64_t qpc = state_->qpc;
+        const std::uint32_t slot = state_->write_slot % hook::kSlots;
 
-        if (shared_mutex_->AcquireSync(hook::kKeyHost, 16) != WAIT_OBJECT_0) {
-            stats_.frames_dropped++;
-            continue;
+        {
+
+            D3DDevice::ContextLock lock(*device_);
+            device_->context()->CopyResource(staging_.Get(), shared_[slot].Get());
         }
-        device_->context()->CopyResource(staging_.Get(), shared_.Get());
-        shared_mutex_->ReleaseSync(hook::kKeyHook);
 
         last_frame_index_ = index;
         stats_.frames_captured++;

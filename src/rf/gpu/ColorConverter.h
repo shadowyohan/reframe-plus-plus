@@ -1,6 +1,9 @@
 #pragma once
 #include <d3d11_4.h>
 
+#include <array>
+#include <utility>
+
 #include <wrl/client.h>
 
 #include "rf/core/Media.h"
@@ -31,6 +34,14 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputs_[kPoolSize];
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> output_views_[kPoolSize];
     int next_output_ = 0;
+
+    static constexpr int kInputCacheSize = 8;
+    std::array<std::pair<ID3D11Texture2D*, Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView>>,
+               kInputCacheSize>
+        input_views_{};
+    int next_input_ = 0;
+
+    Status InputViewFor(ID3D11Texture2D* src, ID3D11VideoProcessorInputView** out);
 
     std::uint32_t src_width_ = 0, src_height_ = 0;
     std::uint32_t dst_width_ = 0, dst_height_ = 0;
