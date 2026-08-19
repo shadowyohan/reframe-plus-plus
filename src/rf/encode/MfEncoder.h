@@ -31,11 +31,14 @@ public:
 private:
     Status SelectTransform();
     Status ConfigureTypes();
+    Status SetInputFormat(const GUID& subtype);
+    Status CreateEncoderDevice();
+    Status CreateSharedInputs();
     Status BindD3DManager();
     Status StartEventLoop();
     void EventLoop();
     Status FeedSample(IMFSample* sample);
-    Status DrainOutput();
+    Status DrainOutput(bool& produced_any);
 
     Status SubmitSurface(ID3D11Texture2D* nv12, Ticks100ns timestamp);
 
@@ -61,10 +64,18 @@ private:
     std::mutex pending_mutex_;
     std::vector<Microsoft::WRL::ComPtr<IMFSample>> pending_;
 
+    static constexpr int kInputTextures = 8;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> inputs_[kInputTextures];
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> encoder_inputs_[kInputTextures];
+    int next_input_ = 0;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> encoder_device_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> encoder_context_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> last_nv12_;
     CodecPrivate codec_private_;
     EncoderStats stats_{};
     std::string name_ = "Media Foundation";
+    bool direct_rgb_ = false;
     Ticks100ns first_pts_ = -1;
     bool mf_started_ = false;
 };

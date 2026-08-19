@@ -57,6 +57,7 @@ int Diagnose() {
         Print(std::format("GPU {}: {} [{}]", a.index, rf::ToUtf8(a.description),
                           rf::ToString(a.vendor)));
         Print(std::format("  VRAM        : {} MiB", a.dedicated_vram / (1024 * 1024)));
+        Print(std::format("  LUID        : {} {}", a.luid_low, a.luid_high));
         Print(std::format("  UMD version : {}", a.driver.str()));
         if (!a.driver_branding.empty())
             Print(std::format("  Driver      : {}", rf::ToUtf8(a.driver_branding)));

@@ -146,18 +146,75 @@ Status MfEncoder::SelectTransform() {
         if (is_async) RF_HR(attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE));
 
         attrs->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
-        attrs->SetUINT32(MF_LOW_LATENCY, config_.low_latency ? TRUE : FALSE);
+        attrs->SetUINT32(MF_LOW_LATENCY, FALSE);
     }
 
     RF_INFO("selected encoder MFT: {}", name_);
     return Status::Ok();
 }
 
+Status MfEncoder::CreateEncoderDevice() {
+    ComPtr<IDXGIAdapter> adapter = device_->adapter();
+    if (!adapter) return Status::Fail("no adapter for the encoder device");
+
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+
+    RF_HR(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
+                            ARRAYSIZE(levels), D3D11_SDK_VERSION, &encoder_device_, nullptr,
+                            &encoder_context_));
+
+    if (ComPtr<ID3D10Multithread> mt; SUCCEEDED(encoder_device_.As(&mt))) mt->SetMultithreadProtected(TRUE);
+    return Status::Ok();
+}
+
+Status MfEncoder::CreateSharedInputs() {
+    const auto& f = config_.format;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = f.width;
+    td.Height = f.height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+    for (int i = 0; i < kInputTextures; ++i) {
+        RF_HR(device_->device()->CreateTexture2D(&td, nullptr, &inputs_[i]));
+
+        ComPtr<IDXGIResource> resource;
+        RF_HR(inputs_[i].As(&resource));
+        HANDLE shared = nullptr;
+        RF_HR(resource->GetSharedHandle(&shared));
+        RF_HR(encoder_device_->OpenSharedResource(shared, IID_PPV_ARGS(&encoder_inputs_[i])));
+    }
+    return Status::Ok();
+}
+
 Status MfEncoder::BindD3DManager() {
     RF_HR(MFCreateDXGIDeviceManager(&dxgi_reset_token_, &dxgi_manager_));
-    RF_HR(dxgi_manager_->ResetDevice(device_->device(), dxgi_reset_token_));
+    RF_HR(dxgi_manager_->ResetDevice(encoder_device_ ? encoder_device_.Get() : device_->device(),
+                                     dxgi_reset_token_));
     RF_HR(transform_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                                      reinterpret_cast<ULONG_PTR>(dxgi_manager_.Get())));
+    return Status::Ok();
+}
+
+Status MfEncoder::SetInputFormat(const GUID& subtype) {
+    const auto& f = config_.format;
+
+    ComPtr<IMFMediaType> in_type;
+    RF_HR(MFCreateMediaType(&in_type));
+    RF_HR(in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
+    RF_HR(in_type->SetGUID(MF_MT_SUBTYPE, subtype));
+    RF_HR(in_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
+    RF_TRY(SetSize(in_type.Get(), MF_MT_FRAME_SIZE, f.width, f.height));
+    RF_TRY(SetRatio(in_type.Get(), MF_MT_FRAME_RATE, f.fps_num, f.fps_den));
+    RF_TRY(SetRatio(in_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
+    RF_HR(transform_->SetInputType(input_stream_, in_type.Get(), 0));
     return Status::Ok();
 }
 
@@ -194,15 +251,10 @@ Status MfEncoder::ConfigureTypes() {
                         hdr ? MFVideoTransFunc_2084 : MFVideoTransFunc_709);
     RF_HR(transform_->SetOutputType(output_stream_, out_type.Get(), 0));
 
-    ComPtr<IMFMediaType> in_type;
-    RF_HR(MFCreateMediaType(&in_type));
-    RF_HR(in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
-    RF_HR(in_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12));
-    RF_HR(in_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
-    RF_TRY(SetSize(in_type.Get(), MF_MT_FRAME_SIZE, f.width, f.height));
-    RF_TRY(SetRatio(in_type.Get(), MF_MT_FRAME_RATE, f.fps_num, f.fps_den));
-    RF_TRY(SetRatio(in_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
-    RF_HR(transform_->SetInputType(input_stream_, in_type.Get(), 0));
+    direct_rgb_ = SetInputFormat(MFVideoFormat_ARGB32).ok();
+    if (!direct_rgb_) RF_TRY(SetInputFormat(MFVideoFormat_NV12));
+
+    RF_INFO("encoder input: {}", direct_rgb_ ? "BGRA direct" : "NV12 via the video processor");
 
     switch (config_.rate_control) {
         case RateControl::CBR:
@@ -236,10 +288,7 @@ Status MfEncoder::ConfigureTypes() {
     const std::uint32_t b = config_.quirks.has(Quirk::Id::DisableBFrames) ? 0 : config_.b_frames;
     TrySetCodecApi(transform_.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, VarU32(b));
 
-    if (config_.low_latency) {
-        TrySetCodecApi(transform_.Get(), CODECAPI_AVLowLatencyMode, VarBool(true));
-        TrySetCodecApi(transform_.Get(), CODECAPI_AVEncCommonLowLatency, VarBool(true));
-    }
+
 
     TrySetCodecApi(transform_.Get(), CODECAPI_AVEncCommonQualityVsSpeed,
                    VarU32(std::min(100u, config_.quality_vs_speed)));
@@ -273,12 +322,31 @@ Status MfEncoder::Open(const EncoderConfig& config, const PacketCallback& on_pac
     mf_started_ = true;
 
     RF_TRY(SelectTransform());
+    if (!config.device_is_dedicated) {
+        if (auto s = CreateEncoderDevice(); !s.ok())
+            RF_WARN("no separate device for the encoder ({}) - sharing the capture one", s.str());
+    }
     RF_TRY(BindD3DManager());
     RF_TRY(ConfigureTypes());
 
-    RF_TRY(converter_.Init(device_, config.format.width, config.format.height,
-                           DXGI_FORMAT_B8G8R8A8_UNORM, config.format.width, config.format.height,
-                           DXGI_FORMAT_NV12, config.format.color));
+    if (!direct_rgb_)
+        RF_TRY(converter_.Init(device_, config.format.width, config.format.height,
+                               DXGI_FORMAT_B8G8R8A8_UNORM, config.format.width,
+                               config.format.height, DXGI_FORMAT_NV12, config.format.color));
+
+    if (direct_rgb_ && encoder_device_) RF_TRY(CreateSharedInputs());
+    if (direct_rgb_ && !encoder_device_) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = config.format.width;
+        td.Height = config.format.height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        for (auto& input : inputs_) RF_HR(device_->device()->CreateTexture2D(&td, nullptr, &input));
+    }
 
     RF_HR(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0));
     RF_HR(transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0));
@@ -299,8 +367,19 @@ void MfEncoder::EventLoop() {
     ::SetThreadDescription(::GetCurrentThread(), L"rf-encode-mf");
     MmcssScope mmcss(L"Playback");
 
+    Ticks100ns last_report = Now100ns();
+    int need_input_events = 0, have_output_events = 0, fed = 0;
+
     while (running_.load(std::memory_order_relaxed)) {
         ComPtr<IMFMediaEvent> event;
+
+        if (Now100ns() - last_report > 5 * kOneSecond100ns) {
+            RF_DEBUG("mft events in {:.1f}s: needinput {}, haveoutput {}, fed {}, pending {}",
+                    static_cast<double>(Now100ns() - last_report) / kOneSecond100ns,
+                    need_input_events, have_output_events, fed, pending_.size());
+            last_report = Now100ns();
+            need_input_events = have_output_events = fed = 0;
+        }
 
         const HRESULT hr = events_->GetEvent(0, &event);
         if (FAILED(hr)) {
@@ -314,7 +393,7 @@ void MfEncoder::EventLoop() {
 
         switch (type) {
             case METransformNeedInput: {
-
+                ++need_input_events;
                 ComPtr<IMFSample> sample;
                 {
                     std::scoped_lock lock(pending_mutex_);
@@ -325,14 +404,19 @@ void MfEncoder::EventLoop() {
                         pending_.erase(pending_.begin());
                     }
                 }
-                if (sample)
+                if (sample) {
+                    ++fed;
                     if (auto s = FeedSample(sample.Get()); !s.ok())
                         RF_WARN("ProcessInput failed: {}", s.str());
+                }
                 break;
             }
-            case METransformHaveOutput:
-                if (auto s = DrainOutput(); !s.ok()) RF_WARN("ProcessOutput: {}", s.str());
+            case METransformHaveOutput: {
+                ++have_output_events;
+                bool produced = false;
+                if (auto s = DrainOutput(produced); !s.ok()) RF_WARN("ProcessOutput: {}", s.str());
                 break;
+            }
             case METransformDrainComplete:
 
                 RF_DEBUG("encoder drain complete - restarting the stream");
@@ -360,7 +444,8 @@ Status MfEncoder::FeedSample(IMFSample* sample) {
     return Status::Ok();
 }
 
-Status MfEncoder::DrainOutput() {
+Status MfEncoder::DrainOutput(bool& produced_any) {
+    produced_any = false;
     MFT_OUTPUT_STREAM_INFO info{};
     RF_HR(transform_->GetOutputStreamInfo(output_stream_, &info));
 
@@ -380,6 +465,7 @@ Status MfEncoder::DrainOutput() {
     DWORD status = 0;
     const HRESULT hr = transform_->ProcessOutput(0, 1, &out, &status);
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return Status::Ok();
+    produced_any = true;
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
         RF_WARN("encoder requested output type renegotiation");
         return Status::Ok();
@@ -425,15 +511,29 @@ Status MfEncoder::DrainOutput() {
 Status MfEncoder::Submit(const CapturedFrame& frame) {
     if (!running_) return Status::Fail("encoder not open");
 
-    if (!frame.content_changed && last_nv12_) {
-        ID3D11Texture2D* previous = last_nv12_.Get();
-        return SubmitSurface(previous, frame.timestamp);
+    if ((!frame.content_changed || !frame.texture) && last_nv12_)
+        return SubmitSurface(last_nv12_.Get(), frame.timestamp);
+    if (!frame.texture) return Status::Ok();
+
+    ID3D11Texture2D* surface = frame.texture;
+    if (!direct_rgb_) {
+        RF_TRY(converter_.Convert(frame.texture, &surface));
+    } else {
+        const int slot = next_input_;
+        next_input_ = (next_input_ + 1) % kInputTextures;
+
+        const D3D11_BOX box{0, 0, 0, config_.format.width, config_.format.height, 1};
+        {
+            D3DDevice::ContextLock lock(*device_);
+            device_->context()->CopySubresourceRegion(inputs_[slot].Get(), 0, 0, 0, 0,
+                                                      frame.texture, 0, &box);
+            if (encoder_device_) device_->context()->Flush();
+        }
+        surface = encoder_device_ ? encoder_inputs_[slot].Get() : inputs_[slot].Get();
     }
 
-    ID3D11Texture2D* nv12 = nullptr;
-    RF_TRY(converter_.Convert(frame.texture, &nv12));
-    last_nv12_ = nv12;
-    return SubmitSurface(nv12, frame.timestamp);
+    last_nv12_ = surface;
+    return SubmitSurface(surface, frame.timestamp);
 }
 
 Status MfEncoder::SubmitSurface(ID3D11Texture2D* nv12, Ticks100ns timestamp) {
@@ -485,8 +585,21 @@ Status MfEncoder::RequestKeyframe() {
 
 Status MfEncoder::Flush() {
     if (!transform_) return Status::Ok();
+
     draining_.store(true, std::memory_order_release);
-    RF_HR(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0));
+    if (FAILED(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0))) {
+        draining_.store(false, std::memory_order_release);
+        return Status::Ok();
+    }
+
+    for (int waited = 0; waited < 400 && draining_.load(std::memory_order_acquire); ++waited)
+        ::Sleep(1);
+
+    if (draining_.exchange(false, std::memory_order_acq_rel)) {
+        RF_WARN("encoder did not report the drain finishing - restarting the stream anyway");
+        transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        need_input_.store(0, std::memory_order_relaxed);
+    }
     return Status::Ok();
 }
 
@@ -506,6 +619,10 @@ void MfEncoder::Close() {
     events_.Reset();
     transform_.Reset();
     dxgi_manager_.Reset();
+    for (auto& input : encoder_inputs_) input.Reset();
+    for (auto& input : inputs_) input.Reset();
+    encoder_context_.Reset();
+    encoder_device_.Reset();
 
     if (mf_started_) {
         MFShutdown();

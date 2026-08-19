@@ -21,21 +21,32 @@ Status Recorder::Init(const Settings& settings) {
     RF_HR(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     mf_started_ = true;
 
-    if (settings_.has_gpu_override()) {
-        RF_TRY(D3DDevice::CreateForLuid(settings_.gpu_luid_low, settings_.gpu_luid_high, device_));
-    } else {
-        RF_TRY(D3DDevice::CreateForOutput(nullptr, device_));
-    }
+    RF_TRY(D3DDevice::CreateForOutput(nullptr, device_));
     device_->SetLowGpuPriority();
 
-    quirks_ = DetectQuirks(device_->info());
+    encode_device_ = device_;
+    if (settings_.has_gpu_override()) {
+        D3DDevicePtr chosen;
+        if (auto s = D3DDevice::CreateForLuid(settings_.gpu_luid_low, settings_.gpu_luid_high,
+                                              chosen);
+            s.ok() && chosen) {
+            encode_device_ = chosen;
+            if (chosen->device() != device_->device())
+                RF_INFO("capture runs on {}, encoding on {}", ToUtf8(device_->info().description),
+                        ToUtf8(chosen->info().description));
+        } else {
+            RF_WARN("the configured encoding GPU is unusable - encoding on the capture one");
+        }
+    }
+
+    quirks_ = DetectQuirks(encode_device_->info());
 
     replay_.Configure(static_cast<Ticks100ns>(settings_.replay_seconds) * kOneSecond100ns,
                       static_cast<std::size_t>(settings_.replay_max_memory_mb) * 1024 * 1024,
                       settings_.temp_dir);
 
-    RF_INFO("recorder initialised on {} ({})", ToUtf8(device_->info().description),
-            ToString(device_->info().vendor));
+    RF_INFO("recorder initialised on {} ({})", ToUtf8(encode_device_->info().description),
+            ToString(encode_device_->info().vendor));
     return Status::Ok();
 }
 
@@ -130,6 +141,8 @@ Status Recorder::BuildPipeline() {
     target.capture_cursor = settings_.capture_cursor;
     target.fps = settings_.ResolvedFps();
 
+    StartWriter();
+
     auto on_frame = [this](const CapturedFrame& f) { OnFrame(f); };
 
     bool hooked = false;
@@ -187,10 +200,28 @@ Status Recorder::BuildPipeline() {
     cfg.input_width = capture_->width();
     cfg.input_height = capture_->height();
 
+    bridge_ready_ = false;
+    if (encode_device_->device() != device_->device()) {
+        if (auto s = bridge_.Init(device_, encode_device_, video_format_.width,
+                                  video_format_.height, DXGI_FORMAT_B8G8R8A8_UNORM);
+            s.ok()) {
+            bridge_ready_ = true;
+            cfg.input_width = video_format_.width;
+            cfg.input_height = video_format_.height;
+        } else {
+            RF_WARN("frames cannot be moved to the encoding GPU ({}) - encoding on the capture one",
+                    s.str());
+            encode_device_ = device_;
+        }
+    }
+
+    cfg.device_is_dedicated = encode_device_->device() != device_->device();
+
     epoch_ = Now100ns();
     cfg.epoch = epoch_;
 
     pacer_period_ = 0;
+    submit_divider_.store(1, std::memory_order_relaxed);
     DWM_TIMING_INFO timing{};
     timing.cbSize = sizeof(timing);
     if (capture_->backend() != CaptureBackend::GameHook &&
@@ -219,7 +250,7 @@ Status Recorder::BuildPipeline() {
 
     cfg.format = video_format_;
 
-    RF_TRY(CreateVideoEncoder(device_, settings_.encoder_backend, encoder_));
+    RF_TRY(CreateVideoEncoder(encode_device_, settings_.encoder_backend, encoder_));
     auto on_packet = [this](PacketPtr p) { OnPacket(std::move(p)); };
 
     if (auto s = encoder_->Open(cfg, on_packet); !s.ok()) {
@@ -227,7 +258,7 @@ Status Recorder::BuildPipeline() {
         RF_WARN("{} unavailable ({}) - falling back to Media Foundation",
                 ToString(encoder_->backend()), s.str());
         encoder_.reset();
-        RF_TRY(CreateVideoEncoder(device_, EncoderBackend::MediaFoundation, encoder_));
+        RF_TRY(CreateVideoEncoder(encode_device_, EncoderBackend::MediaFoundation, encoder_));
         RF_TRY(encoder_->Open(cfg, on_packet));
     }
     encoder_ready_.store(true, std::memory_order_release);
@@ -333,6 +364,7 @@ void Recorder::DisarmReplayLocked() {
     encoder_ready_.store(false, std::memory_order_release);
     if (capture_) capture_->Stop();
     if (encoder_) encoder_->Close();
+    StopWriter();
     if (system_audio_) system_audio_->Stop();
     if (microphone_) microphone_->Stop();
     if (aac_) aac_->Close();
@@ -420,19 +452,32 @@ void Recorder::SubmitPacedLocked(const CapturedFrame& frame, Ticks100ns period) 
     if (next_deadline_ <= frame.timestamp) next_deadline_ = frame.timestamp + period;
 }
 
+Ticks100ns Recorder::SubmitPeriod() const {
+    const Ticks100ns base = pacer_period_ > 0 ? pacer_period_
+                                              : kOneSecond100ns * video_format_.fps_den /
+                                                    std::max(1u, video_format_.fps_num);
+    return base * submit_divider_.load(std::memory_order_relaxed);
+}
+
 void Recorder::OnFrame(const CapturedFrame& frame) {
     if (!encoder_ready_.load(std::memory_order_acquire)) return;
 
+    const Ticks100ns period = SubmitPeriod();
+
+    std::scoped_lock lock(pace_mutex_);
+
     CapturedFrame fitted = frame;
-    if (frame.texture && (frame.width != video_format_.width ||
+    const bool needs_bgra = bridge_ready_ && frame.format != DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (frame.texture && (needs_bgra || frame.width != video_format_.width ||
                           frame.height != video_format_.height)) {
         if (scaler_src_width_ != frame.width || scaler_src_height_ != frame.height) {
             scaler_ = ColorConverter{};
             if (auto s = scaler_.Init(device_, frame.width, frame.height, frame.format,
                                       video_format_.width, video_format_.height,
-                                      DXGI_FORMAT_B8G8R8A8_UNORM, ColorSpace::Rec709);
+                                      DXGI_FORMAT_B8G8R8A8_UNORM, video_format_.color);
                 !s.ok()) {
                 RF_WARN("cannot scale this display into the recording: {}", s.str());
+                scaler_src_width_ = scaler_src_height_ = 0;
                 return;
             }
             scaler_src_width_ = frame.width;
@@ -452,12 +497,15 @@ void Recorder::OnFrame(const CapturedFrame& frame) {
         fitted.format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
 
-    const Ticks100ns period = pacer_period_ > 0
-                                  ? pacer_period_
-                                  : kOneSecond100ns * video_format_.fps_den /
-                                        std::max(1u, video_format_.fps_num);
+    if (fitted.texture && bridge_ready_) {
+        ID3D11Texture2D* imported = nullptr;
+        if (auto s = bridge_.Import(fitted.texture, &imported); !s.ok()) return;
+        fitted.texture = imported;
+        fitted.width = video_format_.width;
+        fitted.height = video_format_.height;
+        fitted.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
 
-    std::scoped_lock lock(pace_mutex_);
     SubmitPacedLocked(fitted, period);
     if (frame_event_) ::SetEvent(frame_event_);
 }
@@ -482,21 +530,16 @@ void Recorder::PacerLoop() {
     ::SetThreadDescription(::GetCurrentThread(), L"rf-idle-fill");
     MmcssScope mmcss(L"Capture");
 
-    const Ticks100ns period = pacer_period_ > 0
-                                  ? pacer_period_
-                                  : kOneSecond100ns * video_format_.fps_den /
-                                        std::max(1u, video_format_.fps_num);
-    const DWORD wait_ms = static_cast<DWORD>(std::max<Ticks100ns>(1, period / 10'000));
+    const DWORD wait_ms = static_cast<DWORD>(std::max<Ticks100ns>(1, SubmitPeriod() / 10'000));
 
     (void)wait_ms;
 
     const DWORD idle_wait =
-        static_cast<DWORD>(std::clamp<Ticks100ns>(2 * period / 10'000, 8, 40));
-    const std::int64_t stall_slots =
-        std::max<std::int64_t>(8, (kOneSecond100ns / 4) / period);
+        static_cast<DWORD>(std::clamp<Ticks100ns>(2 * SubmitPeriod() / 10'000, 8, 40));
 
     Ticks100ns last_stats = Now100ns();
     std::uint64_t last_encoded = 0, last_dropped = 0;
+    int steady_periods = 0;
 
     while (pacing_.load(std::memory_order_relaxed)) {
         ::WaitForSingleObject(frame_event_, idle_wait);
@@ -507,9 +550,30 @@ void Recorder::PacerLoop() {
             now_stats - last_stats > 10 * kOneSecond100ns) {
             const EncoderStats es = encoder_->stats();
             const double secs = static_cast<double>(now_stats - last_stats) / kOneSecond100ns;
+            const std::uint64_t encoded = es.frames_encoded - last_encoded;
+            const std::uint64_t dropped = es.frames_dropped - last_dropped;
+
             RF_INFO("encoder: {:.1f} fps out, {} dropped in the last {:.0f}s (queue {:.1f}, {} total)",
-                    (es.frames_encoded - last_encoded) / secs, es.frames_dropped - last_dropped,
-                    secs, es.avg_queue_depth, es.frames_encoded);
+                    encoded / secs, dropped, secs, es.avg_queue_depth, es.frames_encoded);
+
+            const std::uint32_t divider = submit_divider_.load(std::memory_order_relaxed);
+            const std::uint64_t offered = encoded + dropped;
+
+            if (offered > 0 && dropped * 4 > offered && divider < 4) {
+                submit_divider_.store(divider * 2, std::memory_order_relaxed);
+                RF_WARN("the encoder keeps up with only {:.0f} of {:.0f} fps - recording at {} fps "
+                        "instead, evenly",
+                        encoded / secs, offered / secs,
+                        std::max(1u, video_format_.fps_num / (divider * 2)));
+            } else if (dropped == 0 && divider > 1 && steady_periods >= 3) {
+                submit_divider_.store(divider / 2, std::memory_order_relaxed);
+                RF_INFO("the encoder is keeping up again - back to {} fps",
+                        std::max(1u, video_format_.fps_num / (divider / 2)));
+                steady_periods = 0;
+            }
+
+            steady_periods = dropped == 0 ? steady_periods + 1 : 0;
+
             last_stats = now_stats;
             last_encoded = es.frames_encoded;
             last_dropped = es.frames_dropped;
@@ -518,6 +582,8 @@ void Recorder::PacerLoop() {
         std::scoped_lock lock(pace_mutex_);
         if (!have_last_) continue;
 
+        const Ticks100ns period = SubmitPeriod();
+        const std::int64_t stall_slots = std::max<std::int64_t>(8, (kOneSecond100ns / 4) / period);
         const Ticks100ns now = Now100ns();
 
         if (now - last_pts_ > stall_slots * period) last_pts_ = now - period;
@@ -541,12 +607,63 @@ void Recorder::PacerLoop() {
 void Recorder::OnPacket(PacketPtr packet) {
     if (!packet) return;
 
-    if (settings_.replay_enabled) replay_.Push(packet);
+    constexpr std::size_t kWriterQueueCap = 512;
 
-    if (state_.load() == State::Recording) {
-        std::scoped_lock lock(mux_mutex_);
-        if (muxer_)
-            if (auto s = muxer_->WritePacket(*packet); !s.ok()) RF_WARN("mux: {}", s.str());
+    {
+        std::scoped_lock lock(writer_mutex_);
+        if (!writing_.load(std::memory_order_relaxed)) return;
+        if (writer_queue_.size() >= kWriterQueueCap) {
+            if (++writer_dropped_ % 60 == 1)
+                RF_WARN("packet writer is behind - {} packet(s) dropped so far", writer_dropped_);
+            return;
+        }
+        writer_queue_.push_back(std::move(packet));
+    }
+    writer_cv_.notify_one();
+}
+
+void Recorder::StartWriter() {
+    if (writing_.exchange(true)) return;
+    writer_dropped_ = 0;
+    writer_ = std::thread([this] { WriterLoop(); });
+}
+
+void Recorder::StopWriter() {
+    if (!writing_.exchange(false)) return;
+    writer_cv_.notify_all();
+    if (writer_.joinable()) writer_.join();
+    std::scoped_lock lock(writer_mutex_);
+    writer_queue_.clear();
+}
+
+void Recorder::FlushWriter() {
+    std::unique_lock lock(writer_mutex_);
+    writer_drained_.wait_for(lock, std::chrono::seconds(2), [this] { return writer_queue_.empty(); });
+}
+
+void Recorder::WriterLoop() {
+    ::SetThreadDescription(::GetCurrentThread(), L"rf-writer");
+
+    while (true) {
+        PacketPtr packet;
+        {
+            std::unique_lock lock(writer_mutex_);
+            writer_cv_.wait(lock, [this] {
+                return !writer_queue_.empty() || !writing_.load(std::memory_order_relaxed);
+            });
+            if (writer_queue_.empty()) break;
+            packet = std::move(writer_queue_.front());
+            writer_queue_.pop_front();
+            if (writer_queue_.empty()) writer_drained_.notify_all();
+        }
+
+        if (settings_.replay_enabled) replay_.Push(packet);
+
+        if (state_.load() == State::Recording) {
+            std::scoped_lock lock(mux_mutex_);
+            if (muxer_)
+                if (auto s = muxer_->WritePacket(*packet); !s.ok()) RF_WARN("mux: {}", s.str());
+        }
     }
 }
 
@@ -580,7 +697,6 @@ Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t secon
 
     if (saved_to) *saved_to = path;
 
-    replay_.Clear();
     if (encoder_) encoder_->RequestKeyframe();
 
     RF_INFO("replay saved: {}", path.string());
@@ -615,6 +731,7 @@ Status Recorder::StopRecording() {
     state_ = State::ReplayArmed;
 
     if (encoder_) encoder_->Flush();
+    FlushWriter();
 
     std::scoped_lock lock(mux_mutex_);
     if (muxer_) {
@@ -657,15 +774,21 @@ Status Recorder::SetCaptureMonitorLocked(void* hmonitor) {
 
     auto on_frame = [this](const CapturedFrame& f) { OnFrame(f); };
 
+    capture_->Stop();
+    capture_.reset();
+
     VideoCapturePtr fresh;
     if (Status s = StartDisplayCapture(target, on_frame, fresh); !s) {
-        RF_WARN("could not switch to the other display ({}) - staying on the current one",
-                s.message());
+        RF_WARN("could not switch to the other display ({}) - going back", s.message());
         active_monitor_ = previous;
+
+        CaptureTarget back = target;
+        back.hmonitor = previous;
+        if (Status again = StartDisplayCapture(back, on_frame, capture_); !again)
+            RF_ERROR("the previous display could not be reopened either: {}", again.message());
         return s;
     }
 
-    capture_->Stop();
     capture_ = std::move(fresh);
     RF_INFO("recording moved to another display ({}x{})", capture_->width(), capture_->height());
     return Status::Ok();

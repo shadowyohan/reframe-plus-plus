@@ -198,9 +198,24 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
     pill_rect_ = ImVec4(0, 0, 0, 0);
     hit_rects_.clear();
     if (pill > 0.01f) {
-        const std::string time = std::format("{:02}:{:02}", static_cast<int>(recording_seconds_) / 60,
-                                             static_cast<int>(recording_seconds_) % 60);
-        const ImVec2 text_size = MeasureText(ctx, Font::Toast, time.c_str());
+        const int total_seconds = static_cast<int>(recording_seconds_);
+        const int hours = total_seconds / 3600;
+        const std::string time =
+            hours > 0 ? std::format("{:02}:{:02}:{:02}", hours, total_seconds / 60 % 60,
+                                    total_seconds % 60)
+                      : std::format("{:02}:{:02}", total_seconds / 60, total_seconds % 60);
+
+        float digit_w = 0.0f;
+        for (char digit = '0'; digit <= '9'; ++digit) {
+            const char text[2] = {digit, 0};
+            digit_w = std::max(digit_w, MeasureText(ctx, Font::Toast, text).x);
+        }
+        const float colon_w = MeasureText(ctx, Font::Toast, ":").x;
+        const int digits = hours > 0 ? 6 : 4;
+        const int colons = hours > 0 ? 2 : 1;
+
+        const ImVec2 text_size(digits * digit_w + colons * colon_w,
+                               MeasureText(ctx, Font::Toast, time.c_str()).y);
 
         constexpr float kPad = 10.0f, kGap = 10.0f, kDot = 14.0f, kStopBtn = 24.0f;
 
@@ -241,8 +256,16 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
                 x += chip_w + kGap;
             }
 
-            DrawText(ctx, Font::Toast, ImVec2(x, center.y - text_size.y * 0.5f), kText,
-                     time.c_str());
+            float cell = x;
+            for (char ch : time) {
+                const char text[2] = {ch, 0};
+                const float width = ch == ':' ? colon_w : digit_w;
+                const float glyph = MeasureText(ctx, Font::Toast, text).x;
+                DrawText(ctx, Font::Toast,
+                         ImVec2(cell + (width - glyph) * 0.5f, center.y - text_size.y * 0.5f), kText,
+                         text);
+                cell += width;
+            }
             x += text_size.x + kGap;
 
             const ImVec2 bpos(x, center.y - kStopBtn * 0.5f);

@@ -25,7 +25,7 @@ struct AppModel {
     std::uint64_t disk_used_bytes = 0;
     std::uint64_t disk_total_bytes = 0;
     std::string mic_device_label = "Системный по умолчанию";
-    std::string build_line = "reframe++ 1.1 © | Build: 512. All rights reserved";
+    std::string build_line = "reframe++ 1.1.1 © | Build: 529. All rights reserved";
 
     std::string record_hotkey = "ALT+F9";
     std::string replay_hotkey = "ALT+F10";

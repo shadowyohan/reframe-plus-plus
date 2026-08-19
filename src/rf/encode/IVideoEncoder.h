@@ -40,6 +40,8 @@ struct EncoderConfig {
 
     std::uint32_t quality_vs_speed = 66;
 
+    bool device_is_dedicated = false;
+
     std::uint32_t input_width = 0;
     std::uint32_t input_height = 0;
 

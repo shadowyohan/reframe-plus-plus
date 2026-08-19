@@ -80,6 +80,7 @@ add_library(reframe_core STATIC
 
     rf/gpu/ColorConverter.cpp
     rf/gpu/CursorPainter.cpp
+    rf/gpu/FrameBridge.cpp
     rf/gpu/D3DDevice.cpp
     rf/gpu/GpuInfo.cpp
     rf/gpu/Quirks.cpp

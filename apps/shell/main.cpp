@@ -489,6 +489,32 @@ void FollowCursorAcrossMonitors() {
         refused = static_cast<HMONITOR>(denied);
 }
 
+bool ForegroundOwnsTheScreen() {
+    HWND foreground = ::GetForegroundWindow();
+    if (!foreground || foreground == g_app->overlay.hwnd()) return false;
+
+    DWORD pid = 0;
+    ::GetWindowThreadProcessId(foreground, &pid);
+    if (pid == ::GetCurrentProcessId()) return false;
+
+    RECT window{};
+    if (!::GetWindowRect(foreground, &window)) return false;
+
+    MONITORINFO monitor{sizeof(monitor)};
+    if (!::GetMonitorInfoW(::MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST), &monitor))
+        return false;
+
+    return window.left <= monitor.rcMonitor.left && window.top <= monitor.rcMonitor.top &&
+           window.right >= monitor.rcMonitor.right && window.bottom >= monitor.rcMonitor.bottom;
+}
+
+void ReleaseCursorForMenu(bool wanted) {
+    static bool released = false;
+    if (wanted == released) return;
+    released = wanted;
+    if (wanted) ::ClipCursor(nullptr);
+}
+
 void RefreshMonitors() {
     App& app = *g_app;
     app.model.monitors.clear();
@@ -876,7 +902,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     if (app.settings.replay_enabled) SetReplayArmed(true);
 
-    RF_INFO("reframe++ 1.1.0 build 512, compiled {} {}", __DATE__, __TIME__);
+    RF_INFO("reframe++ 1.1.1 build 529, compiled {} {}", __DATE__, __TIME__);
     RF_INFO("reframe++ ready - Alt+Z opens the overlay");
 
     app.watchdog = std::thread(WatchdogLoop);
@@ -965,7 +991,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         app.stage = "window-style";
 
         const bool drawn_in_game = app.recorder.capture_is_hooked();
-        app.overlay.SetInteractive(app.menu.open() && !drawn_in_game);
+        app.overlay.SetInteractive(app.menu.open() && !drawn_in_game &&
+                                   !ForegroundOwnsTheScreen());
 
         static bool escape_registered = false;
         if (app.menu.open() != escape_registered) {
@@ -978,7 +1005,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
         SetKeyCaptureHook(app.menu.capturing_key());
 
-        const bool in_game_menu = drawn_in_game && app.menu.open();
+        const bool menu_over_game = app.menu.open() && (drawn_in_game || ForegroundOwnsTheScreen());
+        ReleaseCursorForMenu(menu_over_game);
+
+        const bool in_game_menu = menu_over_game;
         SetMouseCaptureHook(in_game_menu);
         app.overlay.SetExternalMouse(
             in_game_menu,
@@ -997,12 +1027,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                                           app.menu.visible() || app.hud.busy());
         }
 
-        static rf::Ticks100ns last_raise = 0;
-        if ((app.menu.visible() || app.hud.busy()) &&
-            rf::Now100ns() - last_raise > rf::MsTo100ns(250)) {
-            last_raise = rf::Now100ns();
+        static bool was_on_screen = false;
+        static HWND last_foreground = nullptr;
+        const bool on_screen = app.menu.visible() || app.hud.busy();
+        HWND foreground_now = ::GetForegroundWindow();
+
+        if (on_screen && (!was_on_screen || foreground_now != last_foreground))
             app.overlay.BringToTop();
-        }
+
+        was_on_screen = on_screen;
+        last_foreground = foreground_now;
 
         bool over_pill = false;
         if (!app.menu.open() && recording) {
@@ -1036,7 +1070,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             app.overlay.EndFrame();
 
             app.stage = "shape";
-            if (app.menu.visible() && !drawn_in_game)
+            if (app.menu.visible() && !menu_over_game)
                 app.overlay.SetShape({});
             else
                 app.overlay.SetShape(app.hud.hit_rects());

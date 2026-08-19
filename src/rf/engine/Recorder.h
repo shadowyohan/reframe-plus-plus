@@ -1,5 +1,7 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -12,6 +14,7 @@
 #include "rf/encode/IVideoEncoder.h"
 #include "rf/engine/Settings.h"
 #include "rf/gpu/ColorConverter.h"
+#include "rf/gpu/FrameBridge.h"
 #include "rf/mux/Mp4Muxer.h"
 #include "rf/replay/ReplayBuffer.h"
 
@@ -51,6 +54,7 @@ public:
     [[nodiscard]] State state() const { return state_.load(); }
 
     [[nodiscard]] const D3DDevicePtr& device() const { return device_; }
+    [[nodiscard]] const D3DDevicePtr& encode_device() const { return encode_device_; }
     [[nodiscard]] Status_ GetStatus() const;
 
     [[nodiscard]] std::string target_app() const;
@@ -83,6 +87,10 @@ private:
     Status BuildPipeline();
     void OnFrame(const CapturedFrame& frame);
     void OnPacket(PacketPtr packet);
+    void StartWriter();
+    void StopWriter();
+    void FlushWriter();
+    void WriterLoop();
     std::filesystem::path MakeOutputPath(const char* suffix) const;
 
     void StartPacer();
@@ -90,18 +98,22 @@ private:
     void PacerLoop();
 
     void SubmitPacedLocked(const CapturedFrame& frame, Ticks100ns period);
+    [[nodiscard]] Ticks100ns SubmitPeriod() const;
 
     void OnSystemAudio(const AudioChunk& chunk);
     void OnMicAudio(const AudioChunk& chunk);
 
     Settings settings_;
     D3DDevicePtr device_;
+    D3DDevicePtr encode_device_;
 
     std::mutex pipeline_mutex_;
     GameWatcher game_watcher_;
 
     void* active_monitor_ = nullptr;
     ColorConverter scaler_;
+    FrameBridge bridge_;
+    bool bridge_ready_ = false;
     std::uint32_t scaler_src_width_ = 0;
     std::uint32_t scaler_src_height_ = 0;
     QuirkSet quirks_;
@@ -116,6 +128,14 @@ private:
     std::mutex mux_mutex_;
     std::unique_ptr<Mp4Muxer> muxer_;
 
+    std::thread writer_;
+    std::atomic<bool> writing_{false};
+    std::mutex writer_mutex_;
+    std::condition_variable writer_cv_;
+    std::condition_variable writer_drained_;
+    std::deque<PacketPtr> writer_queue_;
+    std::uint64_t writer_dropped_ = 0;
+
     std::atomic<State> state_{State::Idle};
 
     bool arm_requested_ = false;
@@ -126,6 +146,7 @@ private:
     Ticks100ns next_deadline_ = 0;
     bool have_last_ = false;
     Ticks100ns pacer_period_ = 0;
+    std::atomic<std::uint32_t> submit_divider_{1};
 
     bool mf_started_ = false;
     std::thread pacer_;

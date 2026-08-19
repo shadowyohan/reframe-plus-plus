@@ -391,7 +391,7 @@ void ScrollArea::Begin(UiContext& ctx, std::uint32_t id, ImVec2 min, ImVec2 max,
     else
         scroll.SetTarget(std::clamp(scroll.target(), 0.0f, max_scroll));
 
-    offset_ = scroll.Update(ctx.dt, spring::kExit);
+    offset_ = std::round(scroll.Update(ctx.dt, spring::kExit));
 
     ctx.dl->PushClipRect(ctx.At(min), ctx.At(max), true);
     ctx.offset.y -= offset_;

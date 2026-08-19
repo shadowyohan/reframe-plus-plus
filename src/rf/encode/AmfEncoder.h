@@ -1,4 +1,8 @@
 #pragma once
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 #include "rf/encode/IVideoEncoder.h"
 #include "rf/gpu/ColorConverter.h"
 
@@ -23,12 +27,31 @@ public:
     static bool Available();
 
 private:
+    struct Api;
+
+    void OutputLoop();
+    void DestroySession();
+
     D3DDevicePtr device_;
     EncoderConfig config_{};
     PacketCallback on_packet_;
     ColorConverter converter_;
     CodecPrivate codec_private_;
     EncoderStats stats_{};
+
+    std::unique_ptr<Api> api_;
+
+    static constexpr int kInputTextures = 8;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> inputs_[kInputTextures];
+    int next_input_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> last_input_;
+
+    std::thread output_thread_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> force_idr_{false};
+    std::mutex submit_mutex_;
+    Ticks100ns epoch_ = 0;
+    bool open_ = false;
 };
 
 }
