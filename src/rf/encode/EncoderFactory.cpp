@@ -10,6 +10,7 @@
 #include "rf/encode/IVideoEncoder.h"
 #include "rf/encode/MfEncoder.h"
 #include "rf/encode/NvencEncoder.h"
+#include "rf/gpu/GpuInfo.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -56,6 +57,72 @@ void ProbeMfCodec(Codec codec, std::vector<EncoderCapability>& out) {
     ::CoTaskMemFree(activates);
 }
 
+GpuVendor VendorFromMft(IMFActivate* activate) {
+    LPWSTR id = nullptr;
+    UINT32 len = 0;
+    if (FAILED(activate->GetAllocatedString(MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, &id, &len)) ||
+        !id)
+        return GpuVendor::Unknown;
+
+    const std::wstring text = id;
+    ::CoTaskMemFree(id);
+
+    if (text == L"VEN_10DE") return GpuVendor::Nvidia;
+    if (text == L"VEN_1002") return GpuVendor::Amd;
+    if (text == L"VEN_8086") return GpuVendor::Intel;
+    return GpuVendor::Unknown;
+}
+
+}
+
+bool HasHardwareEncoder(GpuVendor vendor, Codec codec) {
+    MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Video, MFVideoFormat_NV12};
+    MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Video, SubtypeFor(codec)};
+
+    IMFActivate** activates = nullptr;
+    UINT32 count = 0;
+    if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                         MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in_info, &out_info,
+                         &activates, &count)))
+        return false;
+
+    bool found = false;
+    for (UINT32 i = 0; i < count; ++i) {
+        const GpuVendor owner = VendorFromMft(activates[i]);
+        if (owner == vendor || owner == GpuVendor::Unknown) found = true;
+        activates[i]->Release();
+    }
+    ::CoTaskMemFree(activates);
+    return found;
+}
+
+Status PickEncodingDevice(const D3DDevicePtr& capture, Codec codec, D3DDevicePtr& out) {
+    out = capture;
+    if (!capture) return Status::Fail("null D3D device");
+
+    const GpuVendor own = capture->info().vendor;
+    if ((own == GpuVendor::Nvidia && NvencEncoder::Available()) ||
+        (own == GpuVendor::Amd && AmfEncoder::Available()) || HasHardwareEncoder(own, codec))
+        return Status::Ok();
+
+    for (const AdapterInfo& adapter : EnumerateAdapters()) {
+        if (adapter.is_software || adapter.vendor == own) continue;
+        if (!HasHardwareEncoder(adapter.vendor, codec)) continue;
+
+        D3DDevicePtr other;
+        if (auto s = D3DDevice::Create(adapter, other); !s.ok() || !other) continue;
+
+        RF_INFO("{} cannot encode - encoding on {} instead",
+                ToUtf8(capture->info().description), ToUtf8(adapter.description));
+        out = other;
+        return Status::Ok();
+    }
+
+    RF_WARN("{} has no hardware encoder and no other graphics card can take over - recording on "
+            "the processor. If this machine has integrated graphics, switching it on in the BIOS "
+            "gives the encoder a GPU again.",
+            ToUtf8(capture->info().description));
+    return Status::Ok();
 }
 
 const char* ToString(EncoderBackend b) {

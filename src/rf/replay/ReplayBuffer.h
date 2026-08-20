@@ -27,7 +27,7 @@ public:
     };
 
     void Configure(Ticks100ns window, std::size_t max_bytes,
-                   const std::filesystem::path& temp_dir);
+                   const std::filesystem::path& temp_dir, bool in_memory = false);
 
     void Push(PacketPtr packet);
     void Clear();
@@ -54,6 +54,7 @@ private:
 
         std::FILE* write_file = nullptr;
         std::FILE* read_file = nullptr;
+        std::vector<std::uint8_t> memory;
         std::uint64_t size = 0;
         std::size_t refs = 0;
     };
@@ -74,6 +75,7 @@ private:
     std::uint32_t next_segment_ = 0;
 
     std::filesystem::path dir_;
+    bool in_memory_ = false;
     Ticks100ns window_ = 5 * 60 * kOneSecond100ns;
     std::size_t max_bytes_ = 8ull * 1024 * 1024 * 1024;
     std::size_t bytes_ = 0;

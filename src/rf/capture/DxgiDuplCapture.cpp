@@ -120,7 +120,7 @@ void DxgiDuplCapture::CaptureLoop() {
             continue;
         }
 
-        const Ticks100ns present = info.LastPresentTime.QuadPart;
+        const Ticks100ns present = QpcTo100ns(info.LastPresentTime.QuadPart);
 
         const bool has_new_image = info.AccumulatedFrames > 0 && present != 0 && present != last_present;
 

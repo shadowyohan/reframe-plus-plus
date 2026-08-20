@@ -13,12 +13,25 @@ class Hud {
 public:
     enum class Kind { ReplaySaved, ReplayArmed, RecordingStarted, RecordingStopped, Error };
 
+    struct Badges {
+        bool mic = false;
+        bool mic_muted = false;
+        bool replay = false;
+        std::uint32_t corner = 3;
+        float scale = 1.0f;
+        float opacity = 1.0f;
+    };
+
     void Push(Kind kind, std::string text, std::string thumb_key = {}, std::string app = {});
     void SetRecording(bool recording, double seconds, std::string app = {});
+    void SetChrome(bool indicator, bool stop_button);
+    void SetBadges(const Badges& badges) { badges_ = badges; }
 
     void Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures);
 
-    [[nodiscard]] bool busy() const { return !toasts_.empty() || pill_.value() > 0.01f; }
+    [[nodiscard]] bool busy() const { return needs_top() || badges_.mic || badges_.replay; }
+
+    [[nodiscard]] bool needs_top() const { return !toasts_.empty() || pill_.value() > 0.01f; }
 
     std::function<void()> on_stop;
 
@@ -41,6 +54,8 @@ private:
     void DrawToastIcon(UiContext& ctx, const Toast& toast, ImVec2 card_pos,
                        const TextureCache& textures);
 
+    void DrawBadges(UiContext& ctx, ImVec2 screen);
+
     std::deque<Toast> toasts_;
     Spring pill_{0.0f};
     ImVec4 pill_rect_{0, 0, 0, 0};
@@ -48,6 +63,9 @@ private:
     bool recording_ = false;
     double recording_seconds_ = 0.0;
     std::string recording_app_;
+    Badges badges_;
+    bool show_indicator_ = true;
+    bool show_stop_ = true;
 };
 
 }

@@ -1,5 +1,7 @@
 #include "rf/ui/Hud.h"
 
+#include "rf/core/Lang.h"
+
 #include <algorithm>
 #include <cmath>
 #include <format>
@@ -25,7 +27,9 @@ struct Word {
     float width = 0.0f;
 };
 
-std::vector<Word> SplitAccented(UiContext& ctx, const std::string& text, const std::string& app) {
+std::vector<Word> SplitAccented(UiContext& ctx, const std::string& original,
+                                const std::string& app) {
+    const std::string text(Tr(std::string_view(original)));
     const std::size_t app_begin = app.empty() ? std::string::npos : text.find(app);
     const std::size_t app_end = app_begin == std::string::npos ? 0 : app_begin + app.size();
 
@@ -192,11 +196,59 @@ void Hud::DrawToastIcon(UiContext& ctx, const Toast& toast, ImVec2 card_pos,
     ctx.alpha = saved_alpha;
 }
 
-void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
+void Hud::SetChrome(bool indicator, bool stop_button) {
+    show_indicator_ = indicator;
+    show_stop_ = stop_button;
+    if (!indicator) pill_.SetTarget(0.0f);
+}
 
+void Hud::DrawBadges(UiContext& ctx, ImVec2 screen) {
+    if (!badges_.mic && !badges_.replay) return;
+
+    constexpr float kBase = 24.0f, kGap = 5.0f, kMargin = 12.0f;
+    const float size = kBase * badges_.scale;
+    const int count = (badges_.mic ? 1 : 0) + (badges_.replay ? 1 : 0);
+    const float column = count * size + (count - 1) * kGap;
+
+    const bool right = badges_.corner == 1 || badges_.corner == 3;
+    const bool bottom = badges_.corner >= 2;
+
+    const float x = right ? screen.x - kMargin - size : kMargin;
+    float y = bottom ? screen.y - kMargin - column : kMargin;
+
+    const float saved = ctx.alpha;
+    ctx.alpha = saved * badges_.opacity;
+
+    auto badge = [&](const char* icon, bool slashed) {
+        const ImVec2 min(x, y);
+        const ImVec2 max(x + size, y + size);
+        hit_rects_.push_back(ImVec4(min.x, min.y, max.x, max.y));
+        ctx.dl->AddRectFilled(min, max, ctx.Fade(kPanelBg), size * 0.3f);
+        ctx.dl->AddRect(min, max, ctx.Fade(IM_COL32(255, 255, 255, 26)), size * 0.3f, 0, 1.0f);
+
+        const float inset = size * 0.17f;
+        DrawIcon(ctx, icon, ImVec2(min.x + inset, min.y + inset), size - 2 * inset,
+                 slashed ? kDanger : kText);
+
+        if (slashed) {
+            const float pad = size * 0.22f;
+            ctx.dl->AddLine(ImVec2(min.x + pad, max.y - pad), ImVec2(max.x - pad, min.y + pad),
+                            ctx.Fade(kDanger), std::max(1.5f, size * 0.08f));
+        }
+        y += size + kGap;
+    };
+
+    if (badges_.mic) badge("microphone", badges_.mic_muted);
+    if (badges_.replay) badge("repeat-circle", false);
+
+    ctx.alpha = saved;
+}
+
+void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
     const float pill = pill_.Update(ctx.dt, spring::kPill);
     pill_rect_ = ImVec4(0, 0, 0, 0);
     hit_rects_.clear();
+    DrawBadges(ctx, screen);
     if (pill > 0.01f) {
         const int total_seconds = static_cast<int>(recording_seconds_);
         const int hours = total_seconds / 3600;
@@ -227,7 +279,7 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
         const float chip_h = has_chip ? chip_text.y + 2 * kChipPadY : 0.0f;
 
         const float w = kPad + kDot + kGap + (has_chip ? chip_w + kGap : 0.0f) + text_size.x +
-                        kGap + kStopBtn + kPad;
+                        (show_stop_ ? kGap + kStopBtn : 0.0f) + kPad;
 
         const ImVec2 center(52.0f + w * 0.5f, 50.0f + kPillH * 0.5f);
         const ImVec2 half(w * 0.5f * pill, kPillH * 0.5f * pill);
@@ -268,6 +320,7 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
             }
             x += text_size.x + kGap;
 
+            if (show_stop_) {
             const ImVec2 bpos(x, center.y - kStopBtn * 0.5f);
             Interaction it = Hit(ctx, HashId("pill-stop"), bpos,
                                  ImVec2(bpos.x + kStopBtn, bpos.y + kStopBtn));
@@ -280,6 +333,7 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
             ctx.dl->AddRectFilled(ImVec2(bc.x - sq, bc.y - sq), ImVec2(bc.x + sq, bc.y + sq),
                                   ctx.Fade(kText), 2.0f);
             if (it.clicked && on_stop) on_stop();
+            }
 
             ctx.alpha = saved;
         }

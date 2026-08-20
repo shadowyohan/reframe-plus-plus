@@ -3,6 +3,9 @@ add_executable(reframe-tests
     test_pacer.cpp
     test_settings.cpp
     test_replay_buffer.cpp
+    test_frame_bridge.cpp
+    test_lang.cpp
+    test_text_fits.cpp
 )
 rf_target_defaults(reframe-tests)
 target_link_libraries(reframe-tests PRIVATE rf::core)

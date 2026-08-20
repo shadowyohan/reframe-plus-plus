@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
 #include <vector>
 
@@ -10,6 +11,13 @@
 
 #ifdef RF_HAS_NVENC
 #include <nvEncodeAPI.h>
+
+namespace rf {
+std::uint32_t g_nvenc_minor = NVENCAPI_MINOR_VERSION;
+}
+
+#undef NVENCAPI_VERSION
+#define NVENCAPI_VERSION (NVENCAPI_MAJOR_VERSION | (rf::g_nvenc_minor << 24))
 #endif
 
 namespace rf {
@@ -121,11 +129,19 @@ Status NvencEncoder::InitSession() {
             ::GetProcAddress(api_->dll, "NvEncodeAPIGetMaxSupportedVersion"))) {
         uint32_t supported = 0;
         max_ver(&supported);
-        constexpr uint32_t kBuiltAgainst = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
-        if (supported < kBuiltAgainst)
+        const uint32_t driver_major = supported >> 4;
+        const uint32_t driver_minor = supported & 0xF;
+
+        if (driver_major < NVENCAPI_MAJOR_VERSION)
             return Status::Fail(std::format(
                 "driver supports NVENC API {}.{}, built against {}.{} - update the driver",
-                supported >> 4, supported & 0xF, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION));
+                driver_major, driver_minor, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION));
+
+        if (driver_major == NVENCAPI_MAJOR_VERSION && driver_minor < NVENCAPI_MINOR_VERSION) {
+            g_nvenc_minor = driver_minor;
+            RF_INFO("driver supports NVENC API {}.{} - talking {}.{} to it", driver_major,
+                    driver_minor, NVENCAPI_MAJOR_VERSION, driver_minor);
+        }
     }
 
     auto create = reinterpret_cast<PfnCreateInstance>(

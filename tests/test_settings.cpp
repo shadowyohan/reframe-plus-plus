@@ -53,6 +53,15 @@ Settings Modified() {
     s.hotkey_save_replay_mods = 1;
     s.hotkey_toggle_record_vk = 0x72;
     s.hotkey_toggle_record_mods = 2;
+    s.language = rf::Language::English;
+    s.show_record_indicator = false;
+    s.show_stop_button = false;
+    s.show_mic_indicator = false;
+    s.show_replay_indicator = false;
+    s.hud_corner = 1;
+    s.hud_badge_scale = 1.5f;
+    s.hud_opacity = 0.4f;
+    s.replay_in_memory = true;
     return s;
 }
 
@@ -99,6 +108,15 @@ TEST(Settings_SurviveSaveAndLoad) {
     CHECK_EQ(read.hotkey_save_replay_mods, written.hotkey_save_replay_mods);
     CHECK_EQ(read.hotkey_toggle_record_vk, written.hotkey_toggle_record_vk);
     CHECK_EQ(read.hotkey_toggle_record_mods, written.hotkey_toggle_record_mods);
+    CHECK(read.language == written.language);
+    CHECK(read.show_record_indicator == written.show_record_indicator);
+    CHECK(read.show_stop_button == written.show_stop_button);
+    CHECK(read.show_mic_indicator == written.show_mic_indicator);
+    CHECK(read.show_replay_indicator == written.show_replay_indicator);
+    CHECK_EQ(read.hud_corner, written.hud_corner);
+    CHECK(read.hud_badge_scale > 1.49f && read.hud_badge_scale < 1.51f);
+    CHECK(read.hud_opacity > 0.39f && read.hud_opacity < 0.41f);
+    CHECK(read.replay_in_memory == written.replay_in_memory);
 
     std::error_code ec;
     std::filesystem::remove(TempFile(), ec);
@@ -112,7 +130,10 @@ TEST(Settings_EveryFieldIsWrittenOut) {
     std::string body((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     for (const char* key : {"capture_monitor", "monitor_follow_cursor", "monitor_switch_delay_ms",
-                            "ui_scale_pct", "record_microphone", "audio_tracks", "gpu_luid_low"})
+                            "ui_scale_pct", "record_microphone", "audio_tracks", "gpu_luid_low",
+                            "language", "show_record_indicator", "show_stop_button",
+                            "show_mic_indicator", "show_replay_indicator", "hud_corner",
+                            "hud_badge_scale_pct", "hud_opacity_pct", "replay_in_memory"})
         CHECK(body.find(std::string(key) + "=") != std::string::npos);
 
     std::error_code ec;

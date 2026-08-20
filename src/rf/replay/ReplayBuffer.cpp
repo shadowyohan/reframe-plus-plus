@@ -27,12 +27,18 @@ ReplayBuffer::~ReplayBuffer() {
 }
 
 void ReplayBuffer::Configure(Ticks100ns window, std::size_t max_bytes,
-                             const std::filesystem::path& temp_dir) {
+                             const std::filesystem::path& temp_dir, bool in_memory) {
     StopWriter();
 
     std::scoped_lock lock(mutex_);
     window_ = window;
     max_bytes_ = max_bytes;
+
+    if (in_memory_ != in_memory) {
+        CloseAll();
+        in_memory_ = in_memory;
+        RF_INFO("replay buffer keeps clips {}", in_memory ? "in memory" : "on disk");
+    }
 
     if (dir_ != temp_dir) {
         CloseAll();
@@ -54,7 +60,7 @@ void ReplayBuffer::Configure(Ticks100ns window, std::size_t max_bytes,
 }
 
 void ReplayBuffer::StartWriter() {
-    if (writing_ || dir_.empty()) return;
+    if (writing_ || (dir_.empty() && !in_memory_)) return;
     writing_ = true;
     writer_ = std::thread([this] { WriterLoop(); });
 }
@@ -117,6 +123,11 @@ void ReplayBuffer::WriteLocked(const Packet& packet) {
     if (need_segment) {
         Segment segment;
         segment.id = next_segment_++;
+
+        if (in_memory_) {
+            segment.memory.reserve(kSegmentBytes);
+            segments_.push_back(std::move(segment));
+        } else {
         segment.path = dir_ / std::format("replay-{:06}.bin", segment.id);
 
         segment.write_file = _wfsopen(segment.path.c_str(), L"wb", _SH_DENYNO);
@@ -133,12 +144,16 @@ void ReplayBuffer::WriteLocked(const Packet& packet) {
             return;
         }
         segments_.push_back(std::move(segment));
+        }
     }
 
     Segment& segment = segments_.back();
     const std::uint64_t offset = segment.size;
-    if (std::fwrite(packet.data.data(), 1, packet.data.size(), segment.write_file) !=
-        packet.data.size()) {
+
+    if (in_memory_) {
+        segment.memory.insert(segment.memory.end(), packet.data.begin(), packet.data.end());
+    } else if (std::fwrite(packet.data.data(), 1, packet.data.size(), segment.write_file) !=
+               packet.data.size()) {
         char reason[128] = {};
         strerror_s(reason, errno);
         RF_ERROR("replay spool write failed: {} (errno {})", reason, errno);
@@ -173,10 +188,14 @@ void ReplayBuffer::WriteLocked(const Packet& packet) {
 }
 
 void ReplayBuffer::CloseSegment(Segment& segment) {
+    segment.memory.clear();
+    segment.memory.shrink_to_fit();
     if (segment.write_file) std::fclose(segment.write_file);
     if (segment.read_file) std::fclose(segment.read_file);
     segment.write_file = nullptr;
     segment.read_file = nullptr;
+
+    if (segment.path.empty()) return;
 
     std::error_code ec;
     std::filesystem::remove(segment.path, ec);
@@ -244,6 +263,7 @@ std::vector<PacketPtr> ReplayBuffer::Snapshot(Ticks100ns window) const {
     for (const Segment& segment : segments_)
         if (segment.write_file) std::fflush(segment.write_file);
 
+
     const Ticks100ns newest = video_.back().pts;
     const Ticks100ns wanted = newest - std::min(window, window_);
 
@@ -265,13 +285,15 @@ std::vector<PacketPtr> ReplayBuffer::Snapshot(Ticks100ns window) const {
     std::stable_sort(wanted_entries.begin(), wanted_entries.end(),
                      [](const Entry* a, const Entry* b) { return a->dts < b->dts; });
 
-    std::unordered_map<std::uint32_t, std::FILE*> readers;
-    for (const Segment& segment : segments_) readers[segment.id] = segment.read_file;
+    std::unordered_map<std::uint32_t, const Segment*> readers;
+    for (const Segment& segment : segments_) readers[segment.id] = &segment;
 
     out.reserve(wanted_entries.size());
     for (const Entry* entry : wanted_entries) {
         const auto reader = readers.find(entry->segment);
         if (reader == readers.end() || !reader->second) continue;
+        const Segment& source = *reader->second;
+        if (!in_memory_ && !source.read_file) continue;
 
         auto packet = std::make_shared<Packet>();
         packet->kind = entry->kind;
@@ -282,8 +304,16 @@ std::vector<PacketPtr> ReplayBuffer::Snapshot(Ticks100ns window) const {
         packet->duration = entry->duration;
         packet->data.resize(entry->size);
 
-        if (_fseeki64(reader->second, static_cast<std::int64_t>(entry->offset), SEEK_SET) != 0 ||
-            std::fread(packet->data.data(), 1, entry->size, reader->second) != entry->size) {
+        if (in_memory_) {
+            if (entry->offset + entry->size > source.memory.size()) {
+                RF_WARN("replay buffer lost a packet - clip will be short");
+                break;
+            }
+            std::memcpy(packet->data.data(), source.memory.data() + entry->offset, entry->size);
+        } else if (_fseeki64(source.read_file, static_cast<std::int64_t>(entry->offset),
+                             SEEK_SET) != 0 ||
+                   std::fread(packet->data.data(), 1, entry->size, source.read_file) !=
+                       entry->size) {
             RF_WARN("replay spool read failed - clip will be short");
             break;
         }

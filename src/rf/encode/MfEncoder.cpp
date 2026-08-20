@@ -6,6 +6,8 @@
 #include <mfobjects.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 
 #include "rf/core/Log.h"
 #include "rf/core/Strings.h"
@@ -81,12 +83,25 @@ Status MfEncoder::SelectTransform() {
     const UINT32 flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
                          MFT_ENUM_FLAG_SORTANDFILTER;
 
-    RF_HR(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, &input_info, &output_info, &activates,
-                    &count));
+    if (::GetEnvironmentVariableW(L"REFRAME_FORCE_CPU_ENCODER", nullptr, 0) == 0)
+        RF_HR(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, &input_info, &output_info, &activates,
+                        &count));
+
     if (count == 0) {
         if (activates) ::CoTaskMemFree(activates);
-        return Status::Fail(MF_E_TOPO_CODEC_NOT_FOUND,
-                            "no hardware video encoder MFT for the requested codec");
+        activates = nullptr;
+
+        const UINT32 cpu_flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT |
+                                 MFT_ENUM_FLAG_TRANSCODE_ONLY | MFT_ENUM_FLAG_SORTANDFILTER;
+        RF_HR(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, cpu_flags, &input_info, &output_info,
+                        &activates, &count));
+        if (count == 0) {
+            if (activates) ::CoTaskMemFree(activates);
+            return Status::Fail(MF_E_TOPO_CODEC_NOT_FOUND,
+                                "no video encoder for the requested codec");
+        }
+        software_ = true;
+        RF_WARN("this GPU has no hardware encoder - encoding on the processor instead");
     }
 
     const std::wstring wanted_vendor = [&] -> std::wstring {
@@ -112,7 +127,7 @@ Status MfEncoder::SelectTransform() {
     Status result = Status::Fail("no MFT could be activated");
     for (int pass = 0; pass < 2 && !result.ok(); ++pass) {
 
-        const bool vendor_must_match = pass == 0 && !wanted_vendor.empty();
+        const bool vendor_must_match = pass == 0 && !software_ && !wanted_vendor.empty();
 
         for (UINT32 i = 0; i < count; ++i) {
             if (vendor_must_match && vendor_of(activates[i]) != wanted_vendor) continue;
@@ -145,7 +160,7 @@ Status MfEncoder::SelectTransform() {
         attrs->GetUINT32(MF_TRANSFORM_ASYNC, &is_async);
         if (is_async) RF_HR(attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE));
 
-        attrs->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
+        if (!software_) attrs->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, FALSE);
     }
 
@@ -251,10 +266,12 @@ Status MfEncoder::ConfigureTypes() {
                         hdr ? MFVideoTransFunc_2084 : MFVideoTransFunc_709);
     RF_HR(transform_->SetOutputType(output_stream_, out_type.Get(), 0));
 
-    direct_rgb_ = SetInputFormat(MFVideoFormat_ARGB32).ok();
+    direct_rgb_ = !software_ && SetInputFormat(MFVideoFormat_ARGB32).ok();
     if (!direct_rgb_) RF_TRY(SetInputFormat(MFVideoFormat_NV12));
 
-    RF_INFO("encoder input: {}", direct_rgb_ ? "BGRA direct" : "NV12 via the video processor");
+    RF_INFO("encoder input: {}", direct_rgb_  ? "BGRA direct"
+                                : software_ ? "NV12 in system memory"
+                                            : "NV12 via the video processor");
 
     switch (config_.rate_control) {
         case RateControl::CBR:
@@ -322,11 +339,14 @@ Status MfEncoder::Open(const EncoderConfig& config, const PacketCallback& on_pac
     mf_started_ = true;
 
     RF_TRY(SelectTransform());
-    if (!config.device_is_dedicated) {
-        if (auto s = CreateEncoderDevice(); !s.ok())
-            RF_WARN("no separate device for the encoder ({}) - sharing the capture one", s.str());
+    if (!software_) {
+        if (!config.device_is_dedicated) {
+            if (auto s = CreateEncoderDevice(); !s.ok())
+                RF_WARN("no separate device for the encoder ({}) - sharing the capture one",
+                        s.str());
+        }
+        RF_TRY(BindD3DManager());
     }
-    RF_TRY(BindD3DManager());
     RF_TRY(ConfigureTypes());
 
     if (!direct_rgb_)
@@ -348,9 +368,27 @@ Status MfEncoder::Open(const EncoderConfig& config, const PacketCallback& on_pac
         for (auto& input : inputs_) RF_HR(device_->device()->CreateTexture2D(&td, nullptr, &input));
     }
 
-    RF_HR(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0));
+    if (software_) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = config.format.width;
+        td.Height = config.format.height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_NV12;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        RF_HR(device_->device()->CreateTexture2D(&td, nullptr, &readback_));
+    }
+
+    if (!software_) RF_HR(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0));
     RF_HR(transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0));
     RF_HR(transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0));
+
+    if (software_) {
+        running_ = true;
+        return Status::Ok();
+    }
 
     RF_TRY(StartEventLoop());
     return Status::Ok();
@@ -536,7 +574,64 @@ Status MfEncoder::Submit(const CapturedFrame& frame) {
     return SubmitSurface(surface, frame.timestamp);
 }
 
+Status MfEncoder::PumpSync() {
+    for (;;) {
+        bool produced = false;
+        if (auto s = DrainOutput(produced); !s.ok()) return s;
+        if (!produced) return Status::Ok();
+    }
+}
+
+Status MfEncoder::SubmitOnCpu(ID3D11Texture2D* nv12, Ticks100ns timestamp) {
+    const auto& f = config_.format;
+    const DWORD plane = f.width * f.height;
+
+    ComPtr<IMFMediaBuffer> buffer;
+    RF_HR(MFCreateMemoryBuffer(plane * 3 / 2, &buffer));
+
+    BYTE* dst = nullptr;
+    RF_HR(buffer->Lock(&dst, nullptr, nullptr));
+
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        D3DDevice::ContextLock lock(*device_);
+        device_->context()->CopyResource(readback_.Get(), nv12);
+        const HRESULT hr = device_->context()->Map(readback_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+            buffer->Unlock();
+            return Status::Fail(hr, "reading the frame back for the processor encoder");
+        }
+
+        const auto* src = static_cast<const std::uint8_t*>(mapped.pData);
+        for (std::uint32_t y = 0; y < f.height; ++y)
+            std::memcpy(dst + y * f.width, src + static_cast<std::size_t>(y) * mapped.RowPitch,
+                        f.width);
+
+        const auto* chroma = src + static_cast<std::size_t>(mapped.RowPitch) * f.height;
+        for (std::uint32_t y = 0; y < f.height / 2; ++y)
+            std::memcpy(dst + plane + y * f.width,
+                        chroma + static_cast<std::size_t>(y) * mapped.RowPitch, f.width);
+
+        device_->context()->Unmap(readback_.Get(), 0);
+    }
+
+    buffer->Unlock();
+    RF_HR(buffer->SetCurrentLength(plane * 3 / 2));
+
+    ComPtr<IMFSample> sample;
+    RF_HR(MFCreateSample(&sample));
+    RF_HR(sample->AddBuffer(buffer.Get()));
+
+    if (first_pts_ < 0) first_pts_ = timestamp;
+    RF_HR(sample->SetSampleTime(timestamp - first_pts_));
+    RF_HR(sample->SetSampleDuration(kOneSecond100ns * f.fps_den / std::max(1u, f.fps_num)));
+
+    RF_TRY(FeedSample(sample.Get()));
+    return PumpSync();
+}
+
 Status MfEncoder::SubmitSurface(ID3D11Texture2D* nv12, Ticks100ns timestamp) {
+    if (software_) return SubmitOnCpu(nv12, timestamp);
 
     ComPtr<IMFMediaBuffer> buffer;
     RF_HR(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12, 0, FALSE, &buffer));
@@ -586,6 +681,13 @@ Status MfEncoder::RequestKeyframe() {
 Status MfEncoder::Flush() {
     if (!transform_) return Status::Ok();
 
+    if (software_) {
+        transform_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        RF_TRY(PumpSync());
+        transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        return Status::Ok();
+    }
+
     draining_.store(true, std::memory_order_release);
     if (FAILED(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0))) {
         draining_.store(false, std::memory_order_release);
@@ -623,6 +725,7 @@ void MfEncoder::Close() {
     for (auto& input : inputs_) input.Reset();
     encoder_context_.Reset();
     encoder_device_.Reset();
+    readback_.Reset();
 
     if (mf_started_) {
         MFShutdown();

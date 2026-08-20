@@ -3,6 +3,7 @@
 #include <string>
 
 #include "rf/capture/IVideoCapture.h"
+#include "rf/core/Lang.h"
 #include "rf/core/Media.h"
 #include "rf/encode/IVideoEncoder.h"
 
@@ -28,7 +29,19 @@ struct Settings {
 
     std::uint32_t monitor_switch_delay_ms = 3000;
 
+    Language language = Language::Russian;
+
     float ui_scale = 1.0f;
+
+    bool show_record_indicator = true;
+    bool show_stop_button = true;
+    bool show_mic_indicator = true;
+    bool show_replay_indicator = true;
+    std::uint32_t hud_corner = 3;
+    float hud_badge_scale = 1.0f;
+    float hud_opacity = 1.0f;
+
+    bool replay_in_memory = false;
     std::uint32_t fps = 60;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -105,5 +118,12 @@ inline constexpr std::uint32_t kResolutionHeights[] = {0, 720, 1080, 1440, 2160}
 inline constexpr const char* kFpsNames[] = {"30 FPS", "60 FPS", "120 FPS", "144 FPS"};
 inline constexpr std::uint32_t kFpsValues[] = {30, 60, 120, 144};
 inline constexpr const char* kAudioTrackNames[] = {"Одна дорожка", "Раздельно"};
+
+inline constexpr const char* kHudCornerNames[] = {"Слева сверху", "Справа сверху", "Слева снизу",
+                                                  "Справа снизу"};
+
+inline constexpr float kHudBadgeScaleMin = 0.6f;
+inline constexpr float kHudBadgeScaleMax = 2.0f;
+inline constexpr float kHudOpacityMin = 0.2f;
 
 }

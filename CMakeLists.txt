@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(ReframePlusPlus
-        VERSION 1.1.1
+        VERSION 1.2.0
         DESCRIPTION "Low-overhead GPU screen recorder with instant replay (NVIDIA + AMD + Intel)"
         LANGUAGES CXX C)
 

@@ -25,7 +25,7 @@ struct AppModel {
     std::uint64_t disk_used_bytes = 0;
     std::uint64_t disk_total_bytes = 0;
     std::string mic_device_label = "Системный по умолчанию";
-    std::string build_line = "reframe++ 1.1.1 © | Build: 529. All rights reserved";
+    std::string build_line = "reframe++ 1.2.0 © | Build: 615. All rights reserved";
 
     std::string record_hotkey = "ALT+F9";
     std::string replay_hotkey = "ALT+F10";
@@ -73,7 +73,7 @@ std::string DescribeHotkey(std::uint32_t mods, std::uint32_t vk);
 
 class Menu {
 public:
-    enum class Page { Main, Settings, Video, Audio, Disk, Keybinds, Gallery };
+    enum class Page { Main, Settings, Video, Audio, Disk, Interface, Keybinds, Gallery };
 
     void Open();
     void Close();
@@ -106,6 +106,7 @@ private:
     void PageVideo(UiContext&, ImVec2, ImVec2, AppModel&);
     void PageAudio(UiContext&, ImVec2, ImVec2, AppModel&);
     void PageDisk(UiContext&, ImVec2, ImVec2, AppModel&);
+    void PageInterface(UiContext&, ImVec2, ImVec2, AppModel&);
     void PageKeybinds(UiContext&, ImVec2, ImVec2, AppModel&);
     void PageGallery(UiContext&, ImVec2, ImVec2, AppModel&, TextureCache&);
 
@@ -125,7 +126,7 @@ private:
 
     ScrollArea page_scroll_;
     float content_bottom_ = 0.0f;
-    float page_height_[7] = {};
+    float page_height_[8] = {};
 
     VideoPlayer* player_ = nullptr;
 

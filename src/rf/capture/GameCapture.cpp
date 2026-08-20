@@ -1,5 +1,7 @@
 #include "rf/capture/GameCapture.h"
 
+#include "rf/core/Lang.h"
+
 #include <psapi.h>
 
 #include <algorithm>
@@ -107,7 +109,7 @@ Status HookDllPath(std::wstring& out_path) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec))
         return Status::Fail(
-            std::format("reframe-hook64.dll не найдена рядом с программой ({})", path.string()));
+            TrFormat("reframe-hook64.dll не найдена рядом с программой ({})", path.string()));
 
     out_path = path.wstring();
     return Status::Ok();

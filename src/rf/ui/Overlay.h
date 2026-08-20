@@ -30,6 +30,7 @@ public:
     void EndFrame();
 
     void SetUiScale(float scale);
+    void ReloadAssets();
 
     void SetInteractive(bool interactive);
 

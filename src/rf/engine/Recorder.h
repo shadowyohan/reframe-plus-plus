@@ -73,6 +73,13 @@ public:
         return timestamp + period / 2 >= deadline;
     }
 
+    [[nodiscard]] static Ticks100ns SmoothedSlot(Ticks100ns ideal, Ticks100ns arrived,
+                                                 Ticks100ns period) {
+        const Ticks100ns error = arrived - ideal;
+        if (error > period * 4 || error < -period * 4) return arrived;
+        return ideal + error / 16;
+    }
+
 private:
 
     Status ArmReplayLocked();
@@ -114,6 +121,7 @@ private:
     ColorConverter scaler_;
     FrameBridge bridge_;
     bool bridge_ready_ = false;
+    std::uint64_t bridge_misses_ = 0;
     std::uint32_t scaler_src_width_ = 0;
     std::uint32_t scaler_src_height_ = 0;
     QuirkSet quirks_;
@@ -152,6 +160,9 @@ private:
     std::thread pacer_;
     std::atomic<bool> pacing_{false};
     std::uint64_t paced_index_ = 0;
+    std::atomic<std::uint64_t> frames_offered_{0};
+    std::atomic<std::uint64_t> frames_paced_{0};
+    std::atomic<std::uint64_t> frames_filled_{0};
     HANDLE frame_event_ = nullptr;
     Ticks100ns epoch_ = 0;
 

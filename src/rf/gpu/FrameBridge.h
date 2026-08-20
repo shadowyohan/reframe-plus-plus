@@ -21,6 +21,9 @@ public:
 
 private:
     Status Share(DXGI_FORMAT format, bool keyed);
+    Status Verify(DXGI_FORMAT format);
+    void WaitForCaptureGpu();
+    void Release();
 
     D3DDevicePtr capture_;
     D3DDevicePtr encode_;
@@ -32,8 +35,10 @@ private:
     static constexpr int kSlots = 6;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> written_[kSlots];
     Microsoft::WRL::ComPtr<ID3D11Texture2D> read_[kSlots];
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> landed_[kSlots];
     Microsoft::WRL::ComPtr<IDXGIKeyedMutex> write_mutex_[kSlots];
     Microsoft::WRL::ComPtr<IDXGIKeyedMutex> read_mutex_[kSlots];
+    Microsoft::WRL::ComPtr<ID3D11Query> drawn_;
     int next_ = 0;
 };
 

@@ -1,5 +1,7 @@
 #include "rf/ui/Screens.h"
 
+#include "rf/core/Lang.h"
+
 #include <algorithm>
 #include <cmath>
 #include <format>
@@ -40,7 +42,7 @@ std::string FormatHms(double seconds) {
 }
 
 std::string FormatGb(std::uint64_t bytes) {
-    return std::format("{:.1f} ГБ", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+    return TrFormat("{:.1f} ГБ", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
 }
 
 std::string ElideEnd(UiContext& ctx, Font font, const std::string& utf8, float max_w) {
@@ -459,6 +461,7 @@ void Menu::DrawPage(UiContext& ctx, Page page, ImVec2 panel_min, ImVec2 panel_ma
         case Page::Video:    PageVideo(ctx, panel_min, panel_max, model); break;
         case Page::Audio:    PageAudio(ctx, panel_min, panel_max, model); break;
         case Page::Disk:     PageDisk(ctx, panel_min, panel_max, model); break;
+        case Page::Interface: PageInterface(ctx, panel_min, panel_max, model); break;
         case Page::Keybinds: PageKeybinds(ctx, panel_min, panel_max, model); break;
         case Page::Gallery:  PageGallery(ctx, panel_min, panel_max, model, textures); break;
     }
@@ -613,7 +616,8 @@ void Menu::PageSettings(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec
     static constexpr Entry kEntries[] = {
         {"monitor-recorder", "Видео", "Настройки записи видео", Page::Video, "nav-video"},
         {"sound", "Аудио", "Настройки записи аудио", Page::Audio, "nav-audio"},
-        {"driver-2", "Диск", "Настройки дискового пространства", Page::Disk, "nav-disk"},
+        {"driver-2", "Диск", "Настройки хранилища", Page::Disk, "nav-disk"},
+        {"setting-3", "Интерфейс", "Настройки интерфейса", Page::Interface, "nav-ui"},
         {"driver-2", "Горячие клавиши", "Настройки кейбиндов", Page::Keybinds, "nav-keys"},
     };
 
@@ -628,23 +632,6 @@ void Menu::PageSettings(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec
                                       ImVec2(pos.x + col.w - 62.0f, pos.y + 10.0f), kCircleBtnSize,
                                       "arrow-circle");
         if (row.clicked || btn) Navigate(entry.page, true);
-    }
-
-    {
-        Settings& s = *model.settings;
-        const ImVec2 pos = col.Next(kRowH_Slider);
-        Interaction row = Row(ctx, HashId("s-uiscale"), pos, ImVec2(col.w, kRowH_Slider));
-        RowIcon(ctx, row, pos, "gallery");
-        RowTitle(ctx, pos, "Размер интерфейса");
-        RowSubtitle(ctx, pos, "Масштаб меню и подсказок");
-
-        float percent = s.ui_scale * 100.0f;
-        const std::string label = std::format("{}%", static_cast<int>(percent + 0.5f));
-        if (Slider(ctx, HashId("s-uiscale-s"), pos, col.w, percent, kUiScaleMin * 100.0f,
-                   kUiScaleMax * 100.0f, label.c_str())) {
-            s.ui_scale = percent / 100.0f;
-            if (model.on_settings_changed) model.on_settings_changed();
-        }
     }
 
 }
@@ -695,7 +682,14 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
         Interaction row = Row(ctx, HashId("v-replay"), pos, ImVec2(col.w, kRowH_Slider));
         RowIcon(ctx, row, pos, "repeat-circle");
         RowTitle(ctx, pos, "Длительность повтора");
-        RowSubtitle(ctx, pos, "Можно записать до 20 мин.");
+
+        const double megabytes =
+            (s.bitrate_kbps + s.audio_bitrate_kbps * (s.separate_audio_tracks() ? 2.0 : 1.0)) *
+            s.replay_seconds / 8.0 / 1024.0;
+        const std::string size = megabytes >= 1024.0
+                                     ? TrFormat("{:.1f} ГБ", megabytes / 1024.0)
+                                     : TrFormat("{:.0f} МБ", megabytes);
+        RowSubtitle(ctx, pos, TrFormat("Примерно {} на клип", size).c_str());
 
         float seconds = static_cast<float>(s.replay_seconds);
         const std::string label = FormatHms(seconds);
@@ -730,7 +724,7 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
 
             float seconds = static_cast<float>(s.monitor_switch_delay_ms) / 1000.0f;
             const std::string label =
-                seconds < 0.05f ? std::string("сразу") : std::format("{:.1f} с", seconds);
+                seconds < 0.05f ? std::string(Tr("сразу")) : TrFormat("{:.1f} с", seconds);
             if (Slider(ctx, HashId("v-follow-delay-s"), pos, col.w, seconds, 0.0f, 10.0f,
                        label.c_str())) {
                 s.monitor_switch_delay_ms = static_cast<std::uint32_t>(seconds * 1000.0f + 0.5f);
@@ -1155,6 +1149,123 @@ void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
     if (dirty && model.on_settings_changed) model.on_settings_changed();
 }
 
+void Menu::PageInterface(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
+                         AppModel& model) {
+    Settings& s = *model.settings;
+    Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
+    bool dirty = false;
+
+    DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "интерфейс");
+
+    {
+        const ImVec2 pos = col.Next(kRowH_Simple);
+        Interaction row = Row(ctx, HashId("i-lang"), pos, ImVec2(col.w, kRowH_Simple));
+        RowIcon(ctx, row, pos, "medal-star", kRowIconY + 5.0f);
+        RowTitle(ctx, pos, "Язык", kRowTitleY + 5.0f);
+
+        int index = s.language == Language::English ? 1 : 0;
+        if (Stepper(ctx, HashId("i-lang-s"), pos, col.w, pos.y + kRowH_Simple * 0.5f, index,
+                    static_cast<int>(std::size(kLanguageNames)), kLanguageNames[index])) {
+            s.language = index == 1 ? Language::English : Language::Russian;
+            SetLanguage(s.language);
+            dirty = true;
+        }
+    }
+
+    {
+        const ImVec2 pos = col.Next(kRowH_Slider);
+        Interaction row = Row(ctx, HashId("i-scale"), pos, ImVec2(col.w, kRowH_Slider));
+        RowIcon(ctx, row, pos, "gallery");
+        RowTitle(ctx, pos, "Размер интерфейса");
+        RowSubtitle(ctx, pos, "Масштаб меню и подсказок");
+
+        float percent = s.ui_scale * 100.0f;
+        const std::string label = std::format("{}%", static_cast<int>(percent + 0.5f));
+        if (Slider(ctx, HashId("i-scale-s"), pos, col.w, percent, kUiScaleMin * 100.0f,
+                   kUiScaleMax * 100.0f, label.c_str())) {
+            s.ui_scale = std::round(percent / 5.0f) * 5.0f / 100.0f;
+            dirty = true;
+        }
+    }
+
+    DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "запись");
+
+    auto toggle_row = [&](const char* id, const char* icon, const char* title, const char* subtitle,
+                          bool& value) {
+        const ImVec2 pos = col.Next(kRowH_TwoLine);
+        Interaction row = Row(ctx, HashId(id), pos, ImVec2(col.w, kRowH_TwoLine));
+        RowIcon(ctx, row, pos, icon);
+        RowTitle(ctx, pos, title);
+        RowSubtitle(ctx, pos, subtitle, 41.0f);
+        if (Toggle(ctx, HashId(id, 1), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f), value))
+            dirty = true;
+    };
+
+    toggle_row("i-rec", "record-circle", "Индикатор записи", "Кружок и таймер поверх игры",
+               s.show_record_indicator);
+    if (s.show_record_indicator)
+        toggle_row("i-stop", "close", "Кнопка остановки", "Рядом с индикатором записи",
+                   s.show_stop_button);
+
+    DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "значки");
+
+    toggle_row("i-mic", "microphone", "Индикатор микрофона", "Значок в углу экрана",
+               s.show_mic_indicator);
+    toggle_row("i-replay", "repeat-circle", "Индикатор повтора", "Виден, пока повтор заряжен",
+               s.show_replay_indicator);
+
+    const bool badges = s.show_mic_indicator || s.show_replay_indicator;
+
+    if (badges) {
+        const ImVec2 pos = col.Next(kRowH_Simple);
+        Interaction row = Row(ctx, HashId("i-corner"), pos, ImVec2(col.w, kRowH_Simple));
+        RowIcon(ctx, row, pos, "monitor-recorder", kRowIconY + 5.0f);
+        RowTitle(ctx, pos, "Расположение", kRowTitleY + 5.0f);
+
+        int index = static_cast<int>(s.hud_corner) % static_cast<int>(std::size(kHudCornerNames));
+        if (Stepper(ctx, HashId("i-corner-s"), pos, col.w, pos.y + kRowH_Simple * 0.5f, index,
+                    static_cast<int>(std::size(kHudCornerNames)), kHudCornerNames[index])) {
+            s.hud_corner = static_cast<std::uint32_t>(index);
+            dirty = true;
+        }
+    }
+
+    if (badges) {
+        const ImVec2 pos = col.Next(kRowH_Slider);
+        Interaction row = Row(ctx, HashId("i-size"), pos, ImVec2(col.w, kRowH_Slider));
+        RowIcon(ctx, row, pos, "monitor-recorder");
+        RowTitle(ctx, pos, "Размер значков");
+        RowSubtitle(ctx, pos, "От 60% до 200%");
+
+        float percent = s.hud_badge_scale * 100.0f;
+        const std::string label = std::format("{}%", static_cast<int>(percent + 0.5f));
+        if (Slider(ctx, HashId("i-size-s"), pos, col.w, percent, kHudBadgeScaleMin * 100.0f,
+                   kHudBadgeScaleMax * 100.0f, label.c_str())) {
+            s.hud_badge_scale = std::round(percent / 5.0f) * 5.0f / 100.0f;
+            dirty = true;
+        }
+    }
+
+    if (badges) {
+        const ImVec2 pos = col.Next(kRowH_Slider);
+        Interaction row = Row(ctx, HashId("i-alpha"), pos, ImVec2(col.w, kRowH_Slider));
+        RowIcon(ctx, row, pos, "activity");
+        RowTitle(ctx, pos, "Прозрачность");
+        RowSubtitle(ctx, pos, "Насколько значки видно");
+
+        float percent = s.hud_opacity * 100.0f;
+        const std::string label = std::format("{}%", static_cast<int>(percent + 0.5f));
+        if (Slider(ctx, HashId("i-alpha-s"), pos, col.w, percent, kHudOpacityMin * 100.0f, 100.0f,
+                   label.c_str())) {
+            s.hud_opacity = std::round(percent / 5.0f) * 5.0f / 100.0f;
+            dirty = true;
+        }
+    }
+
+    if (dirty && model.on_settings_changed) model.on_settings_changed();
+}
+
 void Menu::PageKeybinds(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
                         AppModel& model) {
     Settings& s = *model.settings;
@@ -1283,7 +1394,7 @@ void Menu::PageDisk(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 pa
         RowIcon(ctx, row, pos, "data");
         RowTitle(ctx, pos, "Размер хранилища");
 
-        const std::string used = std::format("Использовано {} из {}",
+        const std::string used = TrFormat("Использовано {} из {}",
                                              FormatGb(model.disk_used_bytes),
                                              FormatGb(model.disk_total_bytes));
         RowSubtitle(ctx, pos, used.c_str());
@@ -1294,7 +1405,7 @@ void Menu::PageDisk(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 pa
                                  : 2000.0f;
 
         float gb = std::min(static_cast<float>(s.disk_limit_gb), max_gb);
-        const std::string label = std::format("{} ГБ", static_cast<int>(gb + 0.5f));
+        const std::string label = TrFormat("{} ГБ", static_cast<int>(gb + 0.5f));
         if (Slider(ctx, HashId("d-size-s"), pos, col.w, gb, 10.0f, max_gb, label.c_str()) ||
             gb != static_cast<float>(s.disk_limit_gb)) {
             s.disk_limit_gb = static_cast<std::uint32_t>(gb + 0.5f);
@@ -1334,7 +1445,18 @@ void Menu::PageDisk(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 pa
         }
     };
 
-    path_row("d-temp", "document", "Временные файлы", s.temp_dir);
+    {
+        const ImVec2 pos = col.Next(kRowH_TwoLine);
+        Interaction row = Row(ctx, HashId("d-ram"), pos, ImVec2(col.w, kRowH_TwoLine));
+        RowIcon(ctx, row, pos, "data");
+        RowTitle(ctx, pos, "Хранить откат в ОЗУ");
+        RowSubtitle(ctx, pos, "Без записи на диск, быстрее", 41.0f);
+        if (Toggle(ctx, HashId("d-ram-t"), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f),
+                   s.replay_in_memory))
+            dirty = true;
+    }
+
+    if (!s.replay_in_memory) path_row("d-temp", "document", "Временные файлы", s.temp_dir);
     path_row("d-gallery", "gallery", "Галерея", s.output_dir);
 
     if (dirty && model.on_settings_changed) model.on_settings_changed();

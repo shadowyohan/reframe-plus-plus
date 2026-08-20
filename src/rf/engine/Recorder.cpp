@@ -30,20 +30,30 @@ Status Recorder::Init(const Settings& settings) {
         if (auto s = D3DDevice::CreateForLuid(settings_.gpu_luid_low, settings_.gpu_luid_high,
                                               chosen);
             s.ok() && chosen) {
-            encode_device_ = chosen;
-            if (chosen->device() != device_->device())
-                RF_INFO("capture runs on {}, encoding on {}", ToUtf8(device_->info().description),
-                        ToUtf8(chosen->info().description));
+            const AdapterInfo& picked = chosen->info();
+            const AdapterInfo& capturing = device_->info();
+
+            if (picked.luid_low == capturing.luid_low && picked.luid_high == capturing.luid_high) {
+                RF_INFO("the chosen GPU is the one holding the screen - capturing and encoding on {}",
+                        ToUtf8(capturing.description));
+            } else {
+                encode_device_ = chosen;
+                RF_INFO("capture runs on {}, encoding on {}", ToUtf8(capturing.description),
+                        ToUtf8(picked.description));
+            }
         } else {
             RF_WARN("the configured encoding GPU is unusable - encoding on the capture one");
         }
+    } else if (D3DDevicePtr picked; PickEncodingDevice(device_, settings_.codec, picked).ok() &&
+                                    picked) {
+        encode_device_ = picked;
     }
 
     quirks_ = DetectQuirks(encode_device_->info());
 
     replay_.Configure(static_cast<Ticks100ns>(settings_.replay_seconds) * kOneSecond100ns,
                       static_cast<std::size_t>(settings_.replay_max_memory_mb) * 1024 * 1024,
-                      settings_.temp_dir);
+                      settings_.temp_dir, settings_.replay_in_memory);
 
     RF_INFO("recorder initialised on {} ({})", ToUtf8(encode_device_->info().description),
             ToString(encode_device_->info().vendor));
@@ -73,7 +83,7 @@ Status Recorder::ApplySettings(const Settings& next) {
     settings_ = next;
     replay_.Configure(static_cast<Ticks100ns>(settings_.replay_seconds) * kOneSecond100ns,
                       static_cast<std::size_t>(settings_.replay_max_memory_mb) * 1024 * 1024,
-                      settings_.temp_dir);
+                      settings_.temp_dir, settings_.replay_in_memory);
 
     system_volume_ = settings_.system_volume;
     mic_volume_ = settings_.mic_volume * settings_.mic_gain;
@@ -201,6 +211,7 @@ Status Recorder::BuildPipeline() {
     cfg.input_height = capture_->height();
 
     bridge_ready_ = false;
+    bridge_misses_ = 0;
     if (encode_device_->device() != device_->device()) {
         if (auto s = bridge_.Init(device_, encode_device_, video_format_.width,
                                   video_format_.height, DXGI_FORMAT_B8G8R8A8_UNORM);
@@ -254,6 +265,7 @@ Status Recorder::BuildPipeline() {
     auto on_packet = [this](PacketPtr p) { OnPacket(std::move(p)); };
 
     if (auto s = encoder_->Open(cfg, on_packet); !s.ok()) {
+        if (encoder_->backend() == EncoderBackend::MediaFoundation) return s;
 
         RF_WARN("{} unavailable ({}) - falling back to Media Foundation",
                 ToString(encoder_->backend()), s.str());
@@ -436,6 +448,8 @@ void Recorder::SubmitPacedLocked(const CapturedFrame& frame, Ticks100ns period) 
         if (auto s = encoder_->Submit(out); !s.ok()) RF_WARN("encoder submit: {}", s.str());
     };
 
+    frames_paced_.fetch_add(1, std::memory_order_relaxed);
+
     if (!have_last_) {
         submit(frame.timestamp, true);
         last_pts_ = frame.timestamp;
@@ -444,10 +458,13 @@ void Recorder::SubmitPacedLocked(const CapturedFrame& frame, Ticks100ns period) 
         return;
     }
 
-    if (!PacerAccepts(frame.timestamp, next_deadline_, period)) return;
+    if (!PacerAccepts(frame.timestamp, next_deadline_, period)) {
+        frames_paced_.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
 
-    submit(frame.timestamp, true);
-    last_pts_ = frame.timestamp;
+    last_pts_ = SmoothedSlot(last_pts_ + period, frame.timestamp, period);
+    submit(last_pts_, true);
     next_deadline_ += period;
     if (next_deadline_ <= frame.timestamp) next_deadline_ = frame.timestamp + period;
 }
@@ -461,6 +478,8 @@ Ticks100ns Recorder::SubmitPeriod() const {
 
 void Recorder::OnFrame(const CapturedFrame& frame) {
     if (!encoder_ready_.load(std::memory_order_acquire)) return;
+
+    frames_offered_.fetch_add(1, std::memory_order_relaxed);
 
     const Ticks100ns period = SubmitPeriod();
 
@@ -499,7 +518,12 @@ void Recorder::OnFrame(const CapturedFrame& frame) {
 
     if (fitted.texture && bridge_ready_) {
         ID3D11Texture2D* imported = nullptr;
-        if (auto s = bridge_.Import(fitted.texture, &imported); !s.ok()) return;
+        if (auto s = bridge_.Import(fitted.texture, &imported); !s.ok()) {
+            if (++bridge_misses_ % 120 == 1)
+                RF_WARN("{} frames could not be moved to the encoding GPU: {}", bridge_misses_,
+                        s.str());
+            return;
+        }
         fitted.texture = imported;
         fitted.width = video_format_.width;
         fitted.height = video_format_.height;
@@ -540,6 +564,11 @@ void Recorder::PacerLoop() {
     Ticks100ns last_stats = Now100ns();
     std::uint64_t last_encoded = 0, last_dropped = 0;
     int steady_periods = 0;
+    std::uint64_t loops = 0;
+    Ticks100ns worst_gap = 0;
+    Ticks100ns previous_wake = Now100ns();
+    Ticks100ns worst_fill = 0;
+    Ticks100ns worst_lock = 0;
 
     while (pacing_.load(std::memory_order_relaxed)) {
         ::WaitForSingleObject(frame_event_, idle_wait);
@@ -553,8 +582,22 @@ void Recorder::PacerLoop() {
             const std::uint64_t encoded = es.frames_encoded - last_encoded;
             const std::uint64_t dropped = es.frames_dropped - last_dropped;
 
+            const std::uint64_t offered_in = frames_offered_.exchange(0, std::memory_order_relaxed);
+            const std::uint64_t paced_in = frames_paced_.exchange(0, std::memory_order_relaxed);
+            const std::uint64_t filled_in = frames_filled_.exchange(0, std::memory_order_relaxed);
+
             RF_INFO("encoder: {:.1f} fps out, {} dropped in the last {:.0f}s (queue {:.1f}, {} total)",
                     encoded / secs, dropped, secs, es.avg_queue_depth, es.frames_encoded);
+            RF_INFO("pacer loop: {:.1f} wakes/s, longest sleep {:.0f} ms, longest fill {:.0f} ms, "
+                    "longest lock {:.0f} ms",
+                    loops / secs, Ticks100nsToMs(worst_gap), Ticks100nsToMs(worst_fill),
+                    Ticks100nsToMs(worst_lock));
+            loops = 0;
+            worst_gap = 0;
+            worst_fill = 0;
+            worst_lock = 0;
+            RF_INFO("frames: {:.1f}/s captured, {:.1f}/s paced, {:.1f}/s filled in",
+                    offered_in / secs, paced_in / secs, filled_in / secs);
 
             const std::uint32_t divider = submit_divider_.load(std::memory_order_relaxed);
             const std::uint64_t offered = encoded + dropped;
@@ -579,7 +622,18 @@ void Recorder::PacerLoop() {
             last_dropped = es.frames_dropped;
         }
 
+        ++loops;
+        if (const Ticks100ns wake = Now100ns(); wake - previous_wake > worst_gap) {
+            worst_gap = wake - previous_wake;
+            previous_wake = wake;
+        } else {
+            previous_wake = wake;
+        }
+
+        const Ticks100ns before_lock = Now100ns();
         std::scoped_lock lock(pace_mutex_);
+        const Ticks100ns after_lock = Now100ns();
+        worst_lock = std::max(worst_lock, after_lock - before_lock);
         if (!have_last_) continue;
 
         const Ticks100ns period = SubmitPeriod();
@@ -588,8 +642,10 @@ void Recorder::PacerLoop() {
 
         if (now - last_pts_ > stall_slots * period) last_pts_ = now - period;
 
+        const Ticks100ns fill_started = Now100ns();
         for (int filled = 0; now - last_pts_ > period * 3 / 2 && filled < 8; ++filled) {
             last_pts_ += period;
+            frames_filled_.fetch_add(1, std::memory_order_relaxed);
             CapturedFrame repeat;
             repeat.texture = nullptr;
             repeat.width = video_format_.width;
@@ -601,6 +657,7 @@ void Recorder::PacerLoop() {
                 RF_WARN("encoder submit: {}", s.str());
             next_deadline_ = last_pts_ + period;
         }
+        worst_fill = std::max(worst_fill, Now100ns() - fill_started);
     }
 }
 

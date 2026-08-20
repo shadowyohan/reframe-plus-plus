@@ -54,6 +54,8 @@ inline int RunAll() {
         if (!(cond)) ::testing::ReportFailure(__FILE__, __LINE__, #cond);   \
     } while (0)
 
+#define SKIP(reason) std::printf("    skipped: %s\n", reason)
+
 #define CHECK_EQ(a, b)                                                      \
     do {                                                                    \
         const auto lhs_ = (a);                                              \

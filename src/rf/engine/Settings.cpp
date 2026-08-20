@@ -118,6 +118,17 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.gpu_luid_low = static_cast<std::int32_t>(GetU32(m, "gpu_luid_low", 0));
     s.gpu_luid_high = static_cast<std::int32_t>(GetU32(m, "gpu_luid_high", 0));
     s.hdr = GetBool(m, "hdr", s.hdr);
+    s.language = GetU32(m, "language", 0) == 1 ? Language::English : Language::Russian;
+    s.show_record_indicator = GetBool(m, "show_record_indicator", s.show_record_indicator);
+    s.show_stop_button = GetBool(m, "show_stop_button", s.show_stop_button);
+    s.show_mic_indicator = GetBool(m, "show_mic_indicator", s.show_mic_indicator);
+    s.show_replay_indicator = GetBool(m, "show_replay_indicator", s.show_replay_indicator);
+    s.hud_corner = std::min(GetU32(m, "hud_corner", s.hud_corner), 3u);
+    s.hud_badge_scale = std::clamp(static_cast<float>(GetU32(m, "hud_badge_scale_pct", 100)) / 100.0f,
+                                   kHudBadgeScaleMin, kHudBadgeScaleMax);
+    s.hud_opacity = std::clamp(static_cast<float>(GetU32(m, "hud_opacity_pct", 100)) / 100.0f,
+                               kHudOpacityMin, 1.0f);
+    s.replay_in_memory = GetBool(m, "replay_in_memory", s.replay_in_memory);
     s.replay_enabled = GetBool(m, "replay_enabled", s.replay_enabled);
     s.replay_seconds = GetU32(m, "replay_seconds", s.replay_seconds);
 
@@ -186,6 +197,15 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "gpu_luid_low=" << static_cast<std::uint32_t>(gpu_luid_low) << "\n";
     out << "gpu_luid_high=" << static_cast<std::uint32_t>(gpu_luid_high) << "\n";
     out << "hdr=" << (hdr ? 1 : 0) << "\n";
+    out << "language=" << (language == Language::English ? 1 : 0) << "\n";
+    out << "show_record_indicator=" << (show_record_indicator ? 1 : 0) << "\n";
+    out << "show_stop_button=" << (show_stop_button ? 1 : 0) << "\n";
+    out << "show_mic_indicator=" << (show_mic_indicator ? 1 : 0) << "\n";
+    out << "show_replay_indicator=" << (show_replay_indicator ? 1 : 0) << "\n";
+    out << "hud_corner=" << hud_corner << "\n";
+    out << "hud_badge_scale_pct=" << static_cast<int>(hud_badge_scale * 100.0f + 0.5f) << "\n";
+    out << "hud_opacity_pct=" << static_cast<int>(hud_opacity * 100.0f + 0.5f) << "\n";
+    out << "replay_in_memory=" << (replay_in_memory ? 1 : 0) << "\n";
     out << "replay_enabled=" << (replay_enabled ? 1 : 0) << "\n";
     out << "replay_seconds=" << replay_seconds << "\n";
     out << "replay_max_memory_mb=" << replay_max_memory_mb << "\n";

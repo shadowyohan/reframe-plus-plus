@@ -41,6 +41,8 @@ private:
     Status DrainOutput(bool& produced_any);
 
     Status SubmitSurface(ID3D11Texture2D* nv12, Ticks100ns timestamp);
+    Status SubmitOnCpu(ID3D11Texture2D* nv12, Ticks100ns timestamp);
+    Status PumpSync();
 
     D3DDevicePtr device_;
     EncoderConfig config_{};
@@ -76,6 +78,8 @@ private:
     EncoderStats stats_{};
     std::string name_ = "Media Foundation";
     bool direct_rgb_ = false;
+    bool software_ = false;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> readback_;
     Ticks100ns first_pts_ = -1;
     bool mf_started_ = false;
 };

@@ -23,6 +23,7 @@
 
 #include "resource.h"
 
+#include "rf/core/Lang.h"
 #include "rf/core/Log.h"
 #include "rf/core/Paths.h"
 #include "rf/core/Strings.h"
@@ -570,7 +571,7 @@ void ToggleRecording() {
             const std::string app_name = app.recorder.target_app();
             app.hud.Push(rf::ui::Hud::Kind::RecordingStarted,
                          app_name.empty() ? "Запись запущена"
-                                          : std::format("Запись {} запущена", app_name),
+                                          : rf::TrFormat("Запись {} запущена", app_name),
                          {}, app_name);
         } else {
             RF_ERROR("start recording: {}", s.str());
@@ -589,7 +590,7 @@ void SaveReplay() {
         app.hud.Push(rf::ui::Hud::Kind::ReplaySaved,
                      app_name.empty()
                          ? "Мгновенный повтор сохранен"
-                         : std::format("Мгновенный повтор из {} сохранен", app_name),
+                         : rf::TrFormat("Мгновенный повтор из {} сохранен", app_name),
                      rf::ToUtf8(saved.filename().wstring()), app_name);
         app.gallery.Refresh();
     } else {
@@ -698,10 +699,13 @@ LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 POINT pt{};
                 ::GetCursorPos(&pt);
                 HMENU menu = ::CreatePopupMenu();
-                ::AppendMenuW(menu, MF_STRING, kMenuOpen, L"Открыть reframe++\tAlt+Z");
-                ::AppendMenuW(menu, MF_STRING, kMenuFolder, L"Папка с записями");
+                ::AppendMenuW(menu, MF_STRING, kMenuOpen,
+                  rf::ToWide(rf::Tr("Открыть reframe++\tAlt+Z")).c_str());
+                ::AppendMenuW(menu, MF_STRING, kMenuFolder,
+                  rf::ToWide(rf::Tr("Папка с записями")).c_str());
                 ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-                ::AppendMenuW(menu, MF_STRING, kMenuQuit, L"Выход");
+                ::AppendMenuW(menu, MF_STRING, kMenuQuit,
+                  rf::ToWide(rf::Tr("Выход")).c_str());
                 ::SetForegroundWindow(hwnd);
                 ::TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
                 ::DestroyMenu(menu);
@@ -748,6 +752,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     App app;
     g_app = &app;
     app.settings = rf::Settings::Load(rf::paths::SettingsFile());
+    rf::SetLanguage(app.settings.language);
 
     std::error_code ec;
     std::filesystem::create_directories(app.settings.output_dir, ec);
@@ -902,7 +907,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     if (app.settings.replay_enabled) SetReplayArmed(true);
 
-    RF_INFO("reframe++ 1.1.1 build 529, compiled {} {}", __DATE__, __TIME__);
+    RF_INFO("reframe++ 1.2.0 build 615, compiled {} {}", __DATE__, __TIME__);
     RF_INFO("reframe++ ready - Alt+Z opens the overlay");
 
     app.watchdog = std::thread(WatchdogLoop);
@@ -961,8 +966,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
         FollowCursorAcrossMonitors();
 
-        app.hud.SetRecording(recording && !app.menu.open(), app.model.recording_seconds,
-                             app.recorder.target_app());
+        app.hud.SetChrome(app.settings.show_record_indicator, app.settings.show_stop_button);
+        app.hud.SetRecording(recording && app.settings.show_record_indicator && !app.menu.open(),
+                             app.model.recording_seconds, app.recorder.target_app());
+
+        rf::ui::Hud::Badges badges;
+        badges.mic = app.settings.show_mic_indicator && (recording || app.model.replay_armed);
+        badges.mic_muted = !app.settings.record_microphone;
+        badges.replay =
+            app.settings.show_replay_indicator && app.model.replay_armed && !recording;
+        badges.corner = app.settings.hud_corner;
+        badges.scale = app.settings.hud_badge_scale;
+        badges.opacity = app.settings.hud_opacity;
+        app.hud.SetBadges(badges);
 
         if (now_poll - app.gallery_polled > rf::kOneSecond100ns / 5) {
             app.gallery_polled = now_poll;
@@ -1029,7 +1045,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
         static bool was_on_screen = false;
         static HWND last_foreground = nullptr;
-        const bool on_screen = app.menu.visible() || app.hud.busy();
+        const bool on_screen = app.menu.visible() || app.hud.needs_top();
         HWND foreground_now = ::GetForegroundWindow();
 
         if (on_screen && (!was_on_screen || foreground_now != last_foreground))

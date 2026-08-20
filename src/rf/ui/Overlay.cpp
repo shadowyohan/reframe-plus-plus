@@ -19,6 +19,12 @@ using Microsoft::WRL::ComPtr;
 
 namespace rf::ui {
 namespace {
+
+bool SystemCursorVisible() {
+    CURSORINFO info{sizeof(info)};
+    return ::GetCursorInfo(&info) && (info.flags & CURSOR_SHOWING) != 0 && info.hCursor;
+}
+
 constexpr const wchar_t* kClassName = L"ReframeOverlay";
 }
 
@@ -270,6 +276,23 @@ void Overlay::SetUiScale(float scale) {
     ui_scale_ = wanted;
 
     shape_.clear();
+    ReloadAssets();
+}
+
+void Overlay::ReloadAssets() {
+    if (!imgui_ready_ || !device_) return;
+
+    const float raster = dpi_scale_ * ui_scale_;
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+    fonts_.Load(io, asset_dir_ / "fonts", raster);
+    ImGui_ImplDX11_InvalidateDeviceObjects();
+
+    if (auto s = icons_.Load(device_->device(), asset_dir_ / "icons", raster); !s.ok())
+        RF_WARN("icons: {}", s.str());
+
+    RF_INFO("interface redrawn at {:.0f}% ({:.2f}x pixels)", ui_scale_ * 100.0f, raster);
 }
 
 void Overlay::SetVisible(bool visible) {
@@ -352,6 +375,7 @@ UiContext* Overlay::BeginFrame() {
     ctx_.fonts = &fonts_;
     ctx_.dt = (dt > 0.0f && dt < 0.5f) ? dt : 1.0f / 60.0f;
     ctx_.dpi = dpi_scale_;
+    ctx_.font_scale = 1.0f / ui_scale_;
     if (external_mouse_) {
 
         ctx_.mouse = ImVec2(external_pos_.x / ui_scale_, external_pos_.y / ui_scale_);
@@ -437,7 +461,7 @@ void Overlay::SetExternalMouse(bool active, ImVec2 pos, bool down, float wheel) 
 void Overlay::EndFrame() {
     active_widget_ = ctx_.active_id;
 
-    if (external_mouse_) {
+    if (external_mouse_ && !SystemCursorVisible()) {
         const ImVec2 p = ImVec2(external_pos_.x / ui_scale_, external_pos_.y / ui_scale_);
         const float s = external_down_ ? 0.9f : 1.0f;
         const ImVec2 tip(p.x, p.y);

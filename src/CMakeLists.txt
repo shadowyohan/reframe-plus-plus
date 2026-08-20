@@ -71,6 +71,7 @@ add_custom_command(
 
 add_library(reframe_core STATIC
     ${RF_EMBEDDED_CPP}
+    rf/core/Lang.cpp
     rf/core/Log.cpp
     rf/core/Media.cpp
     rf/core/Paths.cpp

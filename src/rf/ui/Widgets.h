@@ -17,6 +17,7 @@ struct UiContext {
 
     float dt = 1.0f / 60.0f;
     float dpi = 1.0f;
+    float font_scale = 1.0f;
 
     ImVec2 mouse{};
     bool mouse_down = false;
@@ -70,8 +71,9 @@ Interaction Hit(UiContext& ctx, std::uint32_t id, ImVec2 min, ImVec2 max,
 Interaction Row(UiContext& ctx, std::uint32_t id, ImVec2 pos, ImVec2 size, bool clickable = false,
                 bool honour_reserved = true);
 
-void RowIcon(UiContext& ctx, const Interaction& row, ImVec2 row_pos, const char* icon);
-void RowTitle(UiContext& ctx, ImVec2 row_pos, const char* text);
+void RowIcon(UiContext& ctx, const Interaction& row, ImVec2 row_pos, const char* icon,
+             float y = theme::kRowIconY);
+void RowTitle(UiContext& ctx, ImVec2 row_pos, const char* text, float y = theme::kRowTitleY);
 void RowSubtitle(UiContext& ctx, ImVec2 row_pos, const char* text, float y = theme::kRowSubY);
 
 bool Toggle(UiContext& ctx, std::uint32_t id, ImVec2 pos, bool& value);

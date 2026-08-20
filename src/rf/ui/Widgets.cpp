@@ -1,5 +1,7 @@
 #include "rf/ui/Widgets.h"
 
+#include "rf/core/Lang.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -33,20 +35,24 @@ bool UiContext::Reserved(ImVec2 point) const {
 }
 
 ImVec2 MeasureTextWrapped(UiContext& ctx, Font font, float wrap_width, const char* text) {
+    text = Tr(text);
     ImFont* f = ctx.fonts->Get(font);
     if (!f) return ImVec2(0, 0);
-    return f->CalcTextSizeA(f->FontSize, FLT_MAX, wrap_width, text);
+    return f->CalcTextSizeA(f->FontSize * ctx.font_scale, FLT_MAX, wrap_width, text);
 }
 
 void DrawTextWrapped(UiContext& ctx, Font font, ImVec2 pos, float wrap_width, ImU32 col,
                      const char* text) {
+    text = Tr(text);
     ImFont* f = ctx.fonts->Get(font);
     if (!f) return;
-    ctx.dl->AddText(f, f->FontSize, ctx.At(pos), ctx.Fade(col), text, nullptr, wrap_width);
+    ctx.dl->AddText(f, f->FontSize * ctx.font_scale, ctx.At(pos), ctx.Fade(col), text, nullptr,
+                    wrap_width);
 }
 
 float WarningRow(UiContext& ctx, ImVec2 pos, float width, ImU32 accent, ImU32 background,
                  const char* text) {
+    text = Tr(text);
     constexpr float kPad = 10.0f, kGap = 10.0f, kIcon = 24.0f;
 
     const float text_w = width - kPad - kIcon - kGap - kPad;
@@ -64,15 +70,17 @@ float WarningRow(UiContext& ctx, ImVec2 pos, float width, ImU32 accent, ImU32 ba
 }
 
 void DrawText(UiContext& ctx, Font font, ImVec2 pos, ImU32 col, const char* text) {
+    text = Tr(text);
     ImFont* f = ctx.fonts->Get(font);
     if (!f) return;
-    ctx.dl->AddText(f, f->FontSize, ctx.At(pos), ctx.Fade(col), text);
+    ctx.dl->AddText(f, f->FontSize * ctx.font_scale, ctx.At(pos), ctx.Fade(col), text);
 }
 
 ImVec2 MeasureText(UiContext& ctx, Font font, const char* text) {
+    text = Tr(text);
     ImFont* f = ctx.fonts->Get(font);
     if (!f) return ImVec2(0, 0);
-    return f->CalcTextSizeA(f->FontSize, FLT_MAX, 0.0f, text);
+    return f->CalcTextSizeA(f->FontSize * ctx.font_scale, FLT_MAX, 0.0f, text);
 }
 
 void DrawTextCentered(UiContext& ctx, Font font, ImVec2 center, ImU32 col, const char* text) {
@@ -183,32 +191,42 @@ Interaction Row(UiContext& ctx, std::uint32_t id, ImVec2 pos, ImVec2 size, bool 
     return it;
 }
 
-void RowIcon(UiContext& ctx, const Interaction& row, ImVec2 row_pos, const char* icon) {
+void RowIcon(UiContext& ctx, const Interaction& row, ImVec2 row_pos, const char* icon, float y) {
 
     const float scale = 1.0f + 0.10f * row.hover - 0.06f * row.press;
-    DrawIcon(ctx, icon, ImVec2(row_pos.x + theme::kRowIconX, row_pos.y + theme::kRowIconY),
-             theme::kRowIcon, theme::kText, scale);
+    DrawIcon(ctx, icon, ImVec2(row_pos.x + theme::kRowIconX, row_pos.y + y), theme::kRowIcon,
+             theme::kText, scale);
 }
 
-void RowTitle(UiContext& ctx, ImVec2 row_pos, const char* text) {
-    DrawText(ctx, Font::Body, ImVec2(row_pos.x + theme::kRowTextX, row_pos.y + theme::kRowTitleY),
-             theme::kText, text);
+void RowTitle(UiContext& ctx, ImVec2 row_pos, const char* text, float y) {
+    DrawText(ctx, Font::Body, ImVec2(row_pos.x + theme::kRowTextX, row_pos.y + y), theme::kText,
+             text);
 }
 
 void RowSubtitle(UiContext& ctx, ImVec2 row_pos, const char* text, float y) {
+    text = Tr(text);
 
     constexpr float kControlMargin = 105.0f;
     const float room = theme::kPanelW - 2 * theme::kPanelPad - theme::kRowTextX - kControlMargin;
 
     ImFont* font = ctx.fonts->Get(Font::Small);
     const ImVec2 pos(row_pos.x + theme::kRowTextX, row_pos.y + y);
-    if (!font || font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, text).x <= room) {
+    const float size = font ? font->FontSize * ctx.font_scale : 0.0f;
+    if (!font || font->CalcTextSizeA(size, FLT_MAX, 0.0f, text).x <= room) {
         DrawText(ctx, Font::Small, pos, theme::kTextMuted, text);
         return;
     }
 
+    if (ImFont* compact = ctx.fonts->Get(Font::Tiny)) {
+        const float tiny = compact->FontSize * ctx.font_scale;
+        if (compact->CalcTextSizeA(tiny, FLT_MAX, 0.0f, text).x <= room) {
+            DrawText(ctx, Font::Tiny, ImVec2(pos.x, pos.y + 1.0f), theme::kTextMuted, text);
+            return;
+        }
+    }
+
     ctx.dl->PushClipRect(ctx.At(ImVec2(pos.x, pos.y - 4.0f)),
-                         ctx.At(ImVec2(pos.x + room, pos.y + font->FontSize + 4.0f)), true);
+                         ctx.At(ImVec2(pos.x + room, pos.y + size + 4.0f)), true);
     DrawText(ctx, Font::Small, pos, theme::kTextMuted, text);
     ctx.dl->PopClipRect();
 }
