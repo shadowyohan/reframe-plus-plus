@@ -77,6 +77,10 @@ Source: "{#BuildDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; so this one thing lives beside the executable rather than inside it, and must
 ; stay in the same folder - GameCapture resolves it from the running module.
 Source: "{#BuildDir}\reframe-hook64.dll"; DestDir: "{app}"; Flags: ignoreversion
+; Console diagnostics: prints the adapters, the encoders Windows exposes
+; and the log folder. Users are asked for its output when a recording
+; problem needs a hardware answer.
+Source: "{#BuildDir}\reframe-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
