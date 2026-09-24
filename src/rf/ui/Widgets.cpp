@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
+#include <vector>
 
 namespace rf::ui {
 namespace {
@@ -66,6 +68,74 @@ float WarningRow(UiContext& ctx, ImVec2 pos, float width, ImU32 accent, ImU32 ba
     DrawIcon(ctx, "danger", ImVec2(pos.x + kPad, pos.y + kPad), kIcon, accent);
     DrawTextWrapped(ctx, Font::Warning, ImVec2(pos.x + kPad + kIcon + kGap, pos.y + kPad), text_w,
                     accent, text);
+    return height;
+}
+
+float WarningActionRow(UiContext& ctx, std::uint32_t id, ImVec2 pos, float width, ImU32 accent,
+                       ImU32 background, const ActionWarning& warning, bool& pressed) {
+    constexpr float kPad = 10.0f, kGap = 10.0f, kIcon = 24.0f, kButtonH = 28.0f;
+    constexpr float kButtonRadius = 10.0f;
+
+    struct Word {
+        std::string text;
+        Font font;
+        float width;
+    };
+    std::vector<Word> words;
+    auto split = [&](const char* source, Font font) {
+        const std::string text = Tr(source);
+        for (std::size_t i = 0; i < text.size();) {
+            std::size_t end = text.find(' ', i);
+            if (end == std::string::npos) end = text.size();
+            if (end > i) {
+                std::string word = text.substr(i, end - i);
+                const float w = MeasureText(ctx, font, word.c_str()).x;
+                words.push_back({std::move(word), font, w});
+            }
+            i = end + 1;
+        }
+    };
+    split(warning.text, Font::Warning);
+    split(warning.emphasis, Font::WarningBold);
+
+    const float text_x = pos.x + kPad + kIcon + kGap;
+    const float text_w = width - kPad - kIcon - kGap - kPad;
+    const float space = MeasureText(ctx, Font::Warning, " ").x;
+    const float line_h = MeasureText(ctx, Font::Warning, "M").y;
+
+    std::vector<ImVec2> placed;
+    float pen_x = 0.0f, pen_y = 0.0f;
+    for (const Word& word : words) {
+        if (pen_x > 0.0f && pen_x + space + word.width > text_w) {
+            pen_x = 0.0f;
+            pen_y += line_h;
+        } else if (pen_x > 0.0f) {
+            pen_x += space;
+        }
+        placed.emplace_back(text_x + pen_x, pos.y + kPad + pen_y);
+        pen_x += word.width;
+    }
+    const float text_h = pen_y + line_h;
+    const float button_y = pos.y + kPad + std::max(kIcon, text_h) + kGap;
+    const float height = button_y + kButtonH + kPad - pos.y;
+
+    ctx.dl->AddRectFilled(ctx.At(pos), ctx.At(ImVec2(pos.x + width, pos.y + height)),
+                          ctx.Fade(background), theme::kRowRadius);
+    DrawIcon(ctx, "danger", ImVec2(pos.x + kPad, pos.y + kPad), kIcon, accent);
+    for (std::size_t i = 0; i < words.size(); ++i)
+        DrawText(ctx, words[i].font, placed[i], accent, words[i].text.c_str());
+
+    const ImVec2 button_min(pos.x + kPad, button_y);
+    const ImVec2 button_max(pos.x + width - kPad, button_y + kButtonH);
+    Interaction it = Hit(ctx, id, button_min, button_max);
+    const float strength = warning.enabled ? 0.85f + 0.15f * it.hover - 0.1f * it.press : 0.5f;
+    ctx.dl->AddRectFilled(ctx.At(button_min), ctx.At(button_max),
+                          ctx.Fade(WithAlpha(accent, strength)), kButtonRadius);
+    DrawTextCentered(ctx, Font::WarningBold,
+                     ImVec2((button_min.x + button_max.x) * 0.5f, button_y + kButtonH * 0.5f),
+                     theme::kText, warning.button);
+
+    pressed = warning.enabled && it.clicked;
     return height;
 }
 

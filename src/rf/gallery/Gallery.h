@@ -42,6 +42,8 @@ public:
 
     void MarkUploaded(const std::filesystem::path& path);
 
+    void ReloadThumbnail(const std::filesystem::path& path);
+
     void Remove(const std::filesystem::path& path);
 
     [[nodiscard]] bool scanning() const { return scanning_.load(); }

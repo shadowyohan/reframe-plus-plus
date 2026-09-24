@@ -10,9 +10,10 @@
 ; optional autostart and a clean uninstall.
 
 #define AppName        "reframe++"
-#define AppVersion     "1.2.0"
+#define AppVersion     "2.0"
 #define AppPublisher   "shadowyohan"
 #define AppExe         "Reframe.exe"
+#define ElevatedTask   "reframe++"
 
 #ifndef BuildDir
   #define BuildDir "..\build\vs2022\bin"
@@ -98,8 +99,15 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
+Filename: "powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$a = New-ScheduledTaskAction -Execute '{app}\{#AppExe}' -Argument '--from-task'; $p = New-ScheduledTaskPrincipal -UserId '{username}' -LogonType Interactive -RunLevel Highest; $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -Priority 4 -MultipleInstances IgnoreNew; Register-ScheduledTask -TaskName '{#ElevatedTask}' -Action $a -Principal $p -Settings $s -Force"""; \
+    Flags: runhidden waituntilterminated; StatusMsg: "Настройка запуска с повышенным приоритетом..."
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; \
     Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn ""{#ElevatedTask}"" /f"; \
+    Flags: runhidden; RunOnceId: "DeleteElevatedTask"
 
 [UninstallDelete]
 ; The replay spool can be gigabytes; leaving it behind after an uninstall

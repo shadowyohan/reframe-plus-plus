@@ -6,6 +6,12 @@ add_executable(reframe-tests
     test_frame_bridge.cpp
     test_lang.cpp
     test_text_fits.cpp
+    test_texture_cache.cpp
+    test_noise_suppressor.cpp
+    test_app_audio_tracks.cpp
+    test_track_names.cpp
+    test_cursor_painter.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/rnnoise/rnnoise_model.rc
 )
 rf_target_defaults(reframe-tests)
 target_link_libraries(reframe-tests PRIVATE rf::core)

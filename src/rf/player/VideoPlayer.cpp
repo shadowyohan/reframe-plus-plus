@@ -9,6 +9,7 @@
 
 #include "rf/core/Log.h"
 #include "rf/core/Strings.h"
+#include "rf/mux/TrackNames.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -190,6 +191,10 @@ void VideoPlayer::OnEngineEvent(std::uint32_t event) {
 void VideoPlayer::SelectEveryAudioStream() {
     ComPtr<IMFMediaEngineEx> ex;
     if (!engine_ || FAILED(engine_.As(&ex))) return;
+    if (FirstAudioTrackIsFullMix(file_)) {
+        RF_INFO("player: the first audio track already holds everything - playing only it");
+        return;
+    }
 
     DWORD count = 0;
     if (FAILED(ex->GetNumberOfStreams(&count)) || count == 0) return;

@@ -4,11 +4,13 @@
 #include <cstdio>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "rf/core/Media.h"
+#include "rf/core/Status.h"
 
 namespace rf {
 
@@ -32,7 +34,17 @@ public:
     void Push(PacketPtr packet);
     void Clear();
 
-    [[nodiscard]] std::vector<PacketPtr> Snapshot(Ticks100ns window) const;
+    using PacketSink = std::function<Status(PacketPtr)>;
+
+    [[nodiscard]] std::vector<PacketPtr> Snapshot(Ticks100ns window,
+                                                  Ticks100ns* covered_to = nullptr) const;
+
+    [[nodiscard]] Status Snapshot(Ticks100ns window, const PacketSink& sink,
+                                  Ticks100ns* covered_to = nullptr) const;
+
+    [[nodiscard]] Ticks100ns ClipStart(Ticks100ns window) const;
+
+    void DropThrough(Ticks100ns pts);
 
     [[nodiscard]] Stats GetStats() const;
 
@@ -67,6 +79,7 @@ private:
     void CloseSegment(Segment& segment);
     void ReleaseSegment(std::uint32_t id);
     void CloseAll();
+    [[nodiscard]] std::deque<Entry>::const_iterator ClipStartLocked(Ticks100ns window) const;
 
     mutable std::recursive_mutex mutex_;
     std::deque<Entry> video_;

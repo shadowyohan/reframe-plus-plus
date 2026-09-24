@@ -36,6 +36,7 @@ Status NvencEncoder::Submit(const CapturedFrame&) { return Status::Fail("not bui
 Status NvencEncoder::RequestKeyframe() { return Status::Ok(); }
 Status NvencEncoder::Flush() { return Status::Ok(); }
 Status NvencEncoder::InitSession() { return Status::Fail("not built"); }
+int NvencEncoder::PickDepth() const { return 0; }
 void NvencEncoder::OutputLoop() {}
 void NvencEncoder::DestroySession() {}
 
@@ -45,7 +46,7 @@ namespace {
 
 using PfnCreateInstance = NVENCSTATUS(NVENCAPI*)(NV_ENCODE_API_FUNCTION_LIST*);
 
-constexpr int kDepth = 8;
+constexpr int kFatalFailStreak = 16;
 
 const char* NvStatusName(NVENCSTATUS s) {
     switch (s) {
@@ -75,7 +76,7 @@ struct NvencEncoder::Api {
         NV_ENC_INPUT_PTR mapped = nullptr;
         Ticks100ns submitted = 0;
     };
-    Slot slots[kDepth];
+    Slot slots[kMaxDepth];
 
     std::vector<std::pair<ID3D11Texture2D*, NV_ENC_REGISTERED_PTR>> registrations;
 
@@ -158,6 +159,14 @@ Status NvencEncoder::InitSession() {
     session.apiVersion = NVENCAPI_VERSION;
     RF_NV(api_->fn.nvEncOpenEncodeSessionEx(&session, &api_->encoder));
     return Status::Ok();
+}
+
+int NvencEncoder::PickDepth() const {
+    if (!config_.quirks.has(Quirk::Id::EncoderLimitAsyncDepth)) return kMaxDepth;
+    const std::uint64_t vram_mib = device_->info().dedicated_vram / (1024 * 1024);
+    if (vram_mib == 0 || vram_mib <= 2048) return 3;
+    if (vram_mib <= 4096) return 5;
+    return kMaxDepth;
 }
 
 Status NvencEncoder::Open(const EncoderConfig& config, const PacketCallback& on_packet) {
@@ -258,9 +267,12 @@ Status NvencEncoder::Open(const EncoderConfig& config, const PacketCallback& on_
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
-    for (auto& input : inputs_) RF_HR(device_->device()->CreateTexture2D(&td, nullptr, &input));
+    depth_ = PickDepth();
+    input_count_ = std::min(depth_ + 1, kInputTextures);
+    for (int i = 0; i < input_count_; ++i)
+        RF_HR(device_->device()->CreateTexture2D(&td, nullptr, &inputs_[i]));
 
-    for (int i = 0; i < kDepth; ++i) {
+    for (int i = 0; i < depth_; ++i) {
         NV_ENC_CREATE_BITSTREAM_BUFFER bs{};
         bs.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
         RF_NV(api_->fn.nvEncCreateBitstreamBuffer(api_->encoder, &bs));
@@ -294,7 +306,7 @@ Status NvencEncoder::Open(const EncoderConfig& config, const PacketCallback& on_
     RF_INFO("NVENC session up: {}x{}@{} {} kbps GOP={} preset P{} single-pass async depth={} "
             "input={}",
             f.width, f.height, fps, config_.bitrate_kbps, gop,
-            q >= 80 ? 5 : q >= 60 ? 4 : q >= 40 ? 3 : 2, kDepth,
+            q >= 80 ? 5 : q >= 60 ? 4 : q >= 40 ? 3 : 2, depth_,
             direct_rgb_ ? "BGRA direct" : "NV12 via the video processor (scaling)");
     return Status::Ok();
 }
@@ -360,6 +372,8 @@ void NvencEncoder::OutputLoop() {
 
 Status NvencEncoder::Submit(const CapturedFrame& frame) {
     if (!open_) return Status::Fail("encoder not open");
+    if (fatal_.load(std::memory_order_relaxed))
+        return Status::Fail("the NVENC session stopped accepting frames");
 
     ID3D11Texture2D* source = nullptr;
     if (frame.texture && frame.content_changed) {
@@ -373,7 +387,7 @@ Status NvencEncoder::Submit(const CapturedFrame& frame) {
     if (!source) return Status::Ok();
 
     ID3D11Texture2D* input = inputs_[next_input_].Get();
-    next_input_ = (next_input_ + 1) % kInputTextures;
+    next_input_ = (next_input_ + 1) % input_count_;
     {
 
         const D3D11_BOX box{0, 0, 0, config_.format.width, config_.format.height, 1};
@@ -456,10 +470,18 @@ Status NvencEncoder::EncodeTexture(ID3D11Texture2D* input, Ticks100ns timestamp)
         api_->fn.nvEncUnmapInputResource(api_->encoder, s.mapped);
         s.mapped = nullptr;
         ++stats_.frames_dropped;
-        std::scoped_lock lock(mutex_);
-        free_slots_.push_back(slot);
+        {
+            std::scoped_lock lock(mutex_);
+            free_slots_.push_back(slot);
+        }
+        if (fail_streak_.fetch_add(1, std::memory_order_relaxed) + 1 >= kFatalFailStreak &&
+            !fatal_.exchange(true, std::memory_order_relaxed))
+            RF_ERROR("NVENC refused {} frames in a row (last: {}) - the session is unusable, "
+                     "handing the recording to another encoder",
+                     kFatalFailStreak, NvStatusName(enc));
         return Status::Fail(std::string("nvEncEncodePicture -> ") + NvStatusName(enc));
     }
+    fail_streak_.store(0, std::memory_order_relaxed);
 
     {
         std::scoped_lock lock(mutex_);
@@ -495,6 +517,8 @@ void NvencEncoder::DestroySession() {
     inflight_.clear();
     last_input_ = nullptr;
     next_input_ = 0;
+    fail_streak_.store(0, std::memory_order_relaxed);
+    fatal_.store(false, std::memory_order_relaxed);
     open_ = false;
 }
 

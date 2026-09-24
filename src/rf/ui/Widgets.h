@@ -92,6 +92,16 @@ bool Chevron(UiContext& ctx, std::uint32_t id, ImVec2 pos, float size);
 float WarningRow(UiContext& ctx, ImVec2 pos, float width, ImU32 accent, ImU32 background,
                  const char* text);
 
+struct ActionWarning {
+    const char* text = "";
+    const char* emphasis = "";
+    const char* button = "";
+    bool enabled = true;
+};
+
+float WarningActionRow(UiContext& ctx, std::uint32_t id, ImVec2 pos, float width, ImU32 accent,
+                       ImU32 background, const ActionWarning& warning, bool& pressed);
+
 ImVec2 MeasureTextWrapped(UiContext& ctx, Font font, float wrap_width, const char* text);
 void DrawTextWrapped(UiContext& ctx, Font font, ImVec2 pos, float wrap_width, ImU32 col,
                      const char* text);

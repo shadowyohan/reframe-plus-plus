@@ -11,7 +11,15 @@ namespace rf::ui {
 
 class Hud {
 public:
-    enum class Kind { ReplaySaved, ReplayArmed, RecordingStarted, RecordingStopped, Error };
+    enum class Kind {
+        ReplaySaved,
+        ReplayArmed,
+        RecordingStarted,
+        RecordingStopped,
+        Error,
+        TrackLimit,
+        Download,
+    };
 
     struct Badges {
         bool mic = false;
@@ -23,6 +31,9 @@ public:
     };
 
     void Push(Kind kind, std::string text, std::string thumb_key = {}, std::string app = {});
+    void PushTrackLimit(std::string app);
+    void SetDownload(std::string text, std::string product, float progress);
+    void EndDownload();
     void SetRecording(bool recording, double seconds, std::string app = {});
     void SetChrome(bool indicator, bool stop_button);
     void SetBadges(const Badges& badges) { badges_ = badges; }
@@ -45,6 +56,9 @@ private:
         std::string text;
         std::string app;
         std::string thumb_key;
+        std::string subtitle;
+        float progress = -1.0f;
+        bool sticky = false;
         float age = 0.0f;
         bool leaving = false;
         Spring slide{600.0f};

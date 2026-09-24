@@ -175,6 +175,16 @@ void Gallery::MarkUploaded(const std::filesystem::path& path) {
     }
 }
 
+void Gallery::ReloadThumbnail(const std::filesystem::path& path) {
+    std::scoped_lock lock(mutex_);
+    for (auto& item : items_) {
+        if (item.path != path || !item.thumb_uploaded) continue;
+        item.thumb_ready = false;
+        item.thumb_uploaded = false;
+        return;
+    }
+}
+
 void Gallery::Remove(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::remove(path, ec);

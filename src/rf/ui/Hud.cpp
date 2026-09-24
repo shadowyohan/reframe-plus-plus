@@ -21,6 +21,15 @@ constexpr int kMaxToasts = 3;
 
 constexpr float kDegToRad = 3.14159265f / 180.0f;
 
+constexpr ImU32 kNvidiaGreen = IM_COL32(0x76, 0xb9, 0x00, 255);
+constexpr ImU32 kProgressTrack = IM_COL32(255, 255, 255, 26);
+constexpr float kProgressH = 6.0f;
+constexpr float kDetailGap = 5.0f;
+
+bool HasWideIcon(Hud::Kind kind) {
+    return kind == Hud::Kind::TrackLimit || kind == Hud::Kind::Download;
+}
+
 struct Word {
     std::string text;
     bool accent = false;
@@ -49,7 +58,7 @@ std::vector<Word> SplitAccented(UiContext& ctx, const std::string& original,
 }
 
 float DrawAccentedText(UiContext& ctx, const std::vector<Word>& words, float x, float center_y,
-                       float max_width, float line_height, bool draw) {
+                       float max_width, float line_height, bool draw, ImU32 accent = kAppAccent) {
     const float space = MeasureText(ctx, Font::Toast, " ").x;
 
     int lines = 1;
@@ -78,7 +87,7 @@ float DrawAccentedText(UiContext& ctx, const std::vector<Word>& words, float x, 
         } else if (run > 0.0f) {
             pen_x += space;
         }
-        DrawText(ctx, Font::Toast, ImVec2(pen_x, pen_y), w.accent ? kAppAccent : kText,
+        DrawText(ctx, Font::Toast, ImVec2(pen_x, pen_y), w.accent ? accent : kText,
                  w.text.c_str());
         pen_x += w.width;
         run += advance;
@@ -93,6 +102,8 @@ const char* IconFor(Hud::Kind kind) {
         case Hud::Kind::RecordingStarted: return "record-dot";
         case Hud::Kind::RecordingStopped: return "video-circle";
         case Hud::Kind::Error:            return "setting-3";
+        case Hud::Kind::TrackLimit:       return "warning-hex";
+        case Hud::Kind::Download:         return "nvidia";
     }
     return "repeat-circle";
 }
@@ -123,7 +134,39 @@ void Hud::Push(Kind kind, std::string text, std::string thumb_key, std::string a
     toast.icon.Reset(0.0f);
     toasts_.push_back(std::move(toast));
 
-    while (toasts_.size() > kMaxToasts) toasts_.pop_front();
+    while (toasts_.size() > kMaxToasts) {
+        const auto evictable = std::find_if(toasts_.begin(), toasts_.end(),
+                                            [](const Toast& t) { return !t.sticky; });
+        if (evictable == toasts_.end()) break;
+        toasts_.erase(evictable);
+    }
+}
+
+void Hud::PushTrackLimit(std::string app) {
+    Push(Kind::TrackLimit, TrFormat("Звук из {} не записывается на свою дорожку.", app), {}, app);
+    toasts_.back().subtitle = "Достигнут лимит дорожек.";
+}
+
+void Hud::SetDownload(std::string text, std::string product, float progress) {
+    auto it = std::find_if(toasts_.begin(), toasts_.end(),
+                           [](const Toast& t) { return t.kind == Kind::Download && t.sticky; });
+    if (it == toasts_.end()) {
+        Push(Kind::Download, text, {}, product);
+        it = std::prev(toasts_.end());
+        it->sticky = true;
+    }
+    it->text = std::move(text);
+    it->app = std::move(product);
+    it->progress = std::clamp(progress, 0.0f, 1.0f);
+    it->subtitle = std::format("{} / 100%", static_cast<int>(it->progress * 100.0f + 0.5f));
+}
+
+void Hud::EndDownload() {
+    for (Toast& toast : toasts_) {
+        if (toast.kind != Kind::Download || !toast.sticky) continue;
+        toast.sticky = false;
+        toast.age = std::max(toast.age, kToastLifetime - 1.5f);
+    }
 }
 
 void Hud::SetRecording(bool recording, double seconds, std::string app) {
@@ -181,6 +224,16 @@ void Hud::DrawToastIcon(UiContext& ctx, const Toast& toast, ImVec2 card_pos,
             const float scale = 3.0f - 2.0f * std::clamp(t, 0.0f, 1.0f);
             DrawIcon(ctx, IconFor(toast.kind), ImVec2(card_pos.x + 25.0f, card_pos.y + 18.5f),
                      50.0f, kDanger, scale);
+            break;
+        }
+
+        case Kind::TrackLimit:
+        case Kind::Download: {
+            ctx.alpha = saved_alpha * std::clamp((toast.age - kIconDelay) / 0.3f, 0.0f, 1.0f);
+            const float height = toast.kind == Kind::Download ? 54.0f : 50.0f;
+            DrawIcon(ctx, IconFor(toast.kind),
+                     ImVec2(card_pos.x + 20.0f, card_pos.y + (kToastH - height) * 0.5f), height,
+                     kText, std::clamp(t, 0.0f, 1.2f));
             break;
         }
 
@@ -345,7 +398,7 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
     float y = kToastMargin;
     for (auto& toast : toasts_) {
         toast.age += ctx.dt;
-        if (toast.age > kToastLifetime && !toast.leaving) {
+        if (toast.age > kToastLifetime && !toast.leaving && !toast.sticky) {
             toast.leaving = true;
             toast.slide.SetTarget(700.0f);
         }
@@ -382,11 +435,37 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
 
         const float saved_alpha = ctx.alpha;
         ctx.alpha = std::clamp((toast.age - kTextDelay) / kTextFade, 0.0f, 1.0f);
-        const float label_x = card_x + 100.0f;
-        const float label_w = kToastW - 100.0f - 20.0f;
+        const float label_x = card_x + (HasWideIcon(toast.kind) ? 108.0f : 100.0f);
+        const float label_w = card_x + kToastW - 22.0f - label_x;
         const float line_h = MeasureText(ctx, Font::Toast, "M").y;
-        DrawAccentedText(ctx, SplitAccented(ctx, toast.text, toast.app), label_x,
-                         card_y + kToastH * 0.5f, label_w, line_h, true);
+        const ImU32 accent = toast.kind == Kind::Download ? kNvidiaGreen : kAppAccent;
+        const auto words = SplitAccented(ctx, toast.text, toast.app);
+
+        if (toast.subtitle.empty()) {
+            DrawAccentedText(ctx, words, label_x, card_y + kToastH * 0.5f, label_w, line_h, true,
+                             accent);
+        } else {
+            const float title_h =
+                DrawAccentedText(ctx, words, label_x, 0.0f, label_w, line_h, false);
+            const float sub_h = MeasureText(ctx, Font::Tiny, "M").y;
+            const float bar_h = toast.progress >= 0.0f ? kProgressH + kDetailGap : 0.0f;
+            const float block_h = title_h + kDetailGap + bar_h + sub_h;
+            float top = card_y + (kToastH - block_h) * 0.5f;
+
+            DrawAccentedText(ctx, words, label_x, top + title_h * 0.5f, label_w, line_h, true,
+                             accent);
+            top += title_h + kDetailGap;
+            if (toast.progress >= 0.0f) {
+                ctx.dl->AddRectFilled(ImVec2(label_x, top), ImVec2(label_x + label_w, top + kProgressH),
+                                      ctx.Fade(kProgressTrack), 9.0f);
+                if (toast.progress > 0.0f)
+                    ctx.dl->AddRectFilled(ImVec2(label_x, top),
+                                          ImVec2(label_x + label_w * toast.progress, top + kProgressH),
+                                          ctx.Fade(kAppAccent), 9.0f);
+                top += kProgressH + kDetailGap;
+            }
+            DrawText(ctx, Font::Tiny, ImVec2(label_x, top), kTextMuted, toast.subtitle.c_str());
+        }
 
         ctx.alpha = saved_alpha;
         ctx.offset = saved_offset;

@@ -142,7 +142,13 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.bitrate_kbps = std::clamp(s.bitrate_kbps, kBitrateMinKbps, kBitrateMaxKbps);
     s.resolution = GetU32(m, "resolution", s.resolution);
     s.fps_option = GetU32(m, "fps_option", s.fps_option);
-    s.audio_tracks = GetU32(m, "audio_tracks", s.audio_tracks);
+    s.audio_tracks = std::min(GetU32(m, "audio_tracks", s.audio_tracks), kAudioTracksPerApp);
+    s.app_track_slots = std::clamp(GetU32(m, "app_track_slots", s.app_track_slots),
+                                   kAppTrackSlotsMin, kAppTrackSlotsMax);
+    s.mic_noise_suppression = GetBool(m, "mic_noise_suppression", s.mic_noise_suppression);
+    s.noise_suppression = static_cast<NoiseSuppression>(
+        std::min(GetU32(m, "noise_suppression", static_cast<std::uint32_t>(s.noise_suppression)),
+                 static_cast<std::uint32_t>(NoiseSuppression::Maxine)));
     s.system_volume = static_cast<float>(GetU32(m, "system_volume_pct", 100)) / 100.0f;
     s.mic_volume = static_cast<float>(GetU32(m, "mic_volume_pct", 100)) / 100.0f;
     s.mic_gain = static_cast<float>(GetU32(m, "mic_gain_pct", 100)) / 100.0f;
@@ -216,6 +222,9 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "resolution=" << resolution << "\n";
     out << "fps_option=" << fps_option << "\n";
     out << "audio_tracks=" << audio_tracks << "\n";
+    out << "app_track_slots=" << app_track_slots << "\n";
+    out << "mic_noise_suppression=" << (mic_noise_suppression ? 1 : 0) << "\n";
+    out << "noise_suppression=" << static_cast<std::uint32_t>(noise_suppression) << "\n";
     out << "system_volume_pct=" << static_cast<int>(system_volume * 100.0f + 0.5f) << "\n";
     out << "mic_volume_pct=" << static_cast<int>(mic_volume * 100.0f + 0.5f) << "\n";
     out << "mic_gain_pct=" << static_cast<int>(mic_gain * 100.0f + 0.5f) << "\n";

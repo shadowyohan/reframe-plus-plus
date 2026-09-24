@@ -88,15 +88,46 @@ std::vector<AdapterInfo> EnumerateAdapters() {
             info.driver.build = static_cast<std::uint16_t>(umd.QuadPart & 0xFFFF);
         }
 
+        ComPtr<IDXGIOutput> output;
+        while (adapter->EnumOutputs(info.output_count, output.ReleaseAndGetAddressOf()) !=
+               DXGI_ERROR_NOT_FOUND)
+            ++info.output_count;
+
         vendor::EnrichAdapter(info);
 
-        RF_INFO("adapter {}: {} [{}] vram={} MiB driver={} {}", i, ToUtf8(info.description),
-                ToString(info.vendor), info.dedicated_vram / (1024 * 1024), info.driver.str(),
+        RF_INFO("adapter {}: {} [{}] vram={} MiB outputs={} driver={} {}", i,
+                ToUtf8(info.description), ToString(info.vendor),
+                info.dedicated_vram / (1024 * 1024), info.output_count, info.driver.str(),
                 ToUtf8(info.driver_branding));
 
         result.push_back(std::move(info));
     }
     return result;
+}
+
+std::vector<AdapterInfo> EnumerateSelectableAdapters() {
+    const std::vector<AdapterInfo> all = EnumerateAdapters();
+
+    std::vector<AdapterInfo> out;
+    for (const AdapterInfo& adapter : all) {
+        if (adapter.is_software) continue;
+
+        const bool phantom_twin =
+            adapter.output_count == 0 &&
+            std::any_of(all.begin(), all.end(), [&adapter](const AdapterInfo& other) {
+                return other.output_count > 0 && other.vendor_id == adapter.vendor_id &&
+                       other.device_id == adapter.device_id &&
+                       other.description == adapter.description;
+            });
+        if (phantom_twin) {
+            RF_INFO("hiding adapter {} ({}): the same card is already listed with a display on it",
+                    adapter.index, ToUtf8(adapter.description));
+            continue;
+        }
+
+        out.push_back(adapter);
+    }
+    return out;
 }
 
 bool FindAdapterForOutput(void* hwnd, AdapterInfo& out) {

@@ -99,8 +99,12 @@ add_library(reframe_core STATIC
     rf/encode/NvencEncoder.cpp
 
     rf/audio/AacEncoder.cpp
+    rf/audio/AppAudioTracks.cpp
+    rf/audio/MaxineSetup.cpp
+    rf/audio/NoiseSuppressor.cpp
     rf/audio/WasapiCapture.cpp
     rf/mux/Mp4Muxer.cpp
+    rf/mux/TrackNames.cpp
     rf/player/VideoPlayer.cpp
     rf/replay/ReplayBuffer.cpp
 
@@ -125,6 +129,7 @@ target_include_directories(reframe_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # dependency set is visible in one place.
 target_link_libraries(reframe_core PUBLIC
     rf::imgui
+    rf::rnnoise rf::speexdsp
     d3d11 dxgi dxguid dcomp
     mfplat mfuuid mf mfreadwrite
     avrt ole32 oleaut32 shlwapi propsys dwmapi)

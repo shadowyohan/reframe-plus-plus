@@ -32,6 +32,7 @@ private:
     struct Api;
 
     Status InitSession();
+    int PickDepth() const;
     void DestroySession();
     void OutputLoop();
     Status EncodeTexture(ID3D11Texture2D* input, Ticks100ns timestamp);
@@ -52,13 +53,18 @@ private:
     std::deque<int> free_slots_;
     std::deque<int> inflight_;
 
-    static constexpr int kInputTextures = 8;
+    static constexpr int kMaxDepth = 8;
+    static constexpr int kInputTextures = kMaxDepth + 1;
+    int depth_ = kMaxDepth;
+    int input_count_ = kInputTextures;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> inputs_[kInputTextures];
     int next_input_ = 0;
     ID3D11Texture2D* last_input_ = nullptr;
 
     bool direct_rgb_ = false;
 
+    std::atomic<int> fail_streak_{0};
+    std::atomic<bool> fatal_{false};
     std::atomic<bool> force_idr_{false};
     Ticks100ns epoch_ = 0;
     bool open_ = false;

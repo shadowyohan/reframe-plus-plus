@@ -4,12 +4,19 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "rf/audio/AppAudioTracks.h"
+#include "rf/audio/MaxineSetup.h"
+#include "rf/audio/NoiseSuppressor.h"
 #include "rf/core/Log.h"
 #include "rf/core/Paths.h"
 #include "rf/core/Strings.h"
@@ -57,11 +64,18 @@ int Diagnose() {
         Print(std::format("GPU {}: {} [{}]", a.index, rf::ToUtf8(a.description),
                           rf::ToString(a.vendor)));
         Print(std::format("  VRAM        : {} MiB", a.dedicated_vram / (1024 * 1024)));
+        Print(std::format("  Displays    : {}", a.output_count));
         Print(std::format("  LUID        : {} {}", a.luid_low, a.luid_high));
         Print(std::format("  UMD version : {}", a.driver.str()));
         if (!a.driver_branding.empty())
             Print(std::format("  Driver      : {}", rf::ToUtf8(a.driver_branding)));
     }
+
+    Print("");
+    Print("Offered in the GPU picker:");
+    for (const auto& a : rf::EnumerateSelectableAdapters())
+        Print(std::format("  GPU {}: {} ({} display(s))", a.index, rf::ToUtf8(a.description),
+                          a.output_count));
 
     Print("");
     Print(std::format("Windows.Graphics.Capture : {}",
@@ -170,6 +184,92 @@ int RunFor(rf::Recorder& recorder, int seconds, bool recording) {
     return 0;
 }
 
+std::vector<float> ReadMonoWav(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
+    const std::string_view view(bytes.data(), bytes.size());
+    const std::size_t data = view.find("data");
+    std::vector<float> samples;
+    if (data == std::string_view::npos) return samples;
+    for (std::size_t i = data + 8; i + 1 < bytes.size(); i += 2) {
+        const auto value = static_cast<std::int16_t>(static_cast<std::uint8_t>(bytes[i]) |
+                                                     (static_cast<std::uint8_t>(bytes[i + 1]) << 8));
+        samples.push_back(static_cast<float>(value) / 32768.0f);
+    }
+    return samples;
+}
+
+int ProbeDenoise(const std::filesystem::path& wav) {
+    const std::vector<float> mono = ReadMonoWav(wav);
+    if (mono.empty()) {
+        Print("cannot read the WAV (48 kHz 16-bit mono expected)");
+        return 1;
+    }
+    auto rms = [](const std::vector<float>& v) {
+        double sum = 0.0;
+        for (float x : v) sum += static_cast<double>(x) * x;
+        return v.empty() ? 0.0 : std::sqrt(sum / static_cast<double>(v.size()));
+    };
+    Print(std::format("input rms {:.4f}", rms(mono)));
+
+    const char* names[] = {"RNNoise", "Speex", "NVIDIA Maxine"};
+    for (int kind = 0; kind < 3; ++kind) {
+        rf::MicDenoiser denoiser;
+        if (auto s = denoiser.Open(static_cast<rf::NoiseSuppression>(kind)); !s.ok()) {
+            Print(std::format("{}: {}", names[kind], s.str()));
+            continue;
+        }
+        constexpr std::uint32_t kChunk = 441;
+        std::vector<float> out;
+        std::vector<float> chunk(kChunk * 2);
+        for (std::size_t pos = 0; pos + kChunk <= mono.size(); pos += kChunk) {
+            for (std::uint32_t i = 0; i < kChunk; ++i) chunk[i * 2] = chunk[i * 2 + 1] = mono[pos + i];
+            denoiser.Process(chunk.data(), kChunk, 2);
+            for (std::uint32_t i = 0; i < kChunk; ++i) out.push_back(chunk[i * 2]);
+        }
+        Print(std::format("{}: output rms {:.4f}", names[kind], rms(out)));
+    }
+    return 0;
+}
+
+int ProbeAudio(int seconds) {
+    const char* generations[] = {"none", "Turing", "Ampere", "Ada", "Blackwell"};
+    Print(std::format("RTX generation   : {}",
+                      generations[static_cast<int>(rf::DetectRtxGeneration())]));
+    Print(std::format("NVIDIA Maxine    : {}", rf::MaxineInstalled() ? "installed" : "missing"));
+
+    const auto apps = rf::AppAudioTracks::ActiveAudioApps();
+    Print(std::format("apps making sound: {}", apps.size()));
+
+    struct Probe {
+        rf::AudioApp app;
+        rf::WasapiCapture capture;
+        std::atomic<float> peak{0.0f};
+        rf::Status started = rf::Status::Ok();
+    };
+    std::vector<std::unique_ptr<Probe>> probes;
+    for (const auto& app : apps) {
+        auto probe = std::make_unique<Probe>();
+        probe->app = app;
+        Probe* target = probe.get();
+        probe->started = probe->capture.StartApplication(app.root_pid, [target](const rf::AudioChunk& c) {
+            float peak = target->peak.load();
+            for (std::uint32_t i = 0; i < c.frames * c.channels; ++i)
+                peak = std::max(peak, std::abs(c.samples[i]));
+            target->peak.store(peak);
+        });
+        probes.push_back(std::move(probe));
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    for (auto& probe : probes) {
+        probe->capture.Stop();
+        Print(std::format("  {} (PID {}): {}", probe->app.name, probe->app.root_pid,
+                          probe->started.ok() ? std::format("peak {:.3f}", probe->peak.load())
+                                              : probe->started.str()));
+    }
+    return 0;
+}
+
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -184,6 +284,10 @@ int wmain(int argc, wchar_t** argv) {
 
     if (command == "diagnose") {
         exit_code = Diagnose();
+    } else if (command == "denoise" && argc > 2) {
+        exit_code = ProbeDenoise(argv[2]);
+    } else if (command == "audio") {
+        exit_code = ProbeAudio(argc > 2 ? seconds : 3);
     } else if (command == "capture") {
         auto backend = rf::CaptureBackend::Auto;
         if (argc > 3) {
@@ -194,6 +298,15 @@ int wmain(int argc, wchar_t** argv) {
         exit_code = ProbeCapture(seconds, backend);
     } else {
         auto settings = rf::Settings::Load(rf::paths::SettingsFile());
+        if (argc > 3 && rf::ToUtf8(argv[3]) == "split") {
+            settings.record_system_audio = true;
+            settings.audio_tracks = 1;
+        }
+        if (argc > 3 && rf::ToUtf8(argv[3]) == "apps") {
+            settings.record_system_audio = true;
+            settings.audio_tracks = rf::kAudioTracksPerApp;
+            settings.mic_noise_suppression = true;
+        }
 
         rf::Recorder recorder;
         if (auto s = recorder.Init(settings); !s.ok()) {
@@ -213,7 +326,7 @@ int wmain(int argc, wchar_t** argv) {
             settings.replay_enabled = false;
             exit_code = RunFor(recorder, seconds, false);
         } else {
-            Print("usage: reframe-cli [diagnose|capture <s>|record <s>|replay <s>|bench <s>]");
+            Print("usage: reframe-cli [diagnose|audio <s>|denoise <wav>|capture <s>|record <s>|replay <s>|bench <s>]");
             exit_code = 2;
         }
         recorder.Shutdown();

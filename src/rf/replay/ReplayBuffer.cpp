@@ -117,8 +117,7 @@ void ReplayBuffer::WriteLocked(const Packet& packet) {
     if (packet.data.empty()) return;
 
     const bool need_segment =
-        segments_.empty() || (segments_.back().size >= kSegmentBytes &&
-                              packet.kind == MediaKind::Video && packet.keyframe);
+        segments_.empty() || segments_.back().size + packet.data.size() > kSegmentBytes;
 
     if (need_segment) {
         Segment segment;
@@ -255,24 +254,28 @@ void ReplayBuffer::Clear() {
     CloseAll();
 }
 
-std::vector<PacketPtr> ReplayBuffer::Snapshot(Ticks100ns window) const {
-    std::scoped_lock lock(mutex_);
+std::vector<PacketPtr> ReplayBuffer::Snapshot(Ticks100ns window, Ticks100ns* covered_to) const {
     std::vector<PacketPtr> out;
-    if (video_.empty()) return out;
+    const auto collect = [&out](PacketPtr packet) {
+        out.push_back(std::move(packet));
+        return Status::Ok();
+    };
+    if (auto s = Snapshot(window, collect, covered_to); !s.ok()) out.clear();
+    return out;
+}
+
+Status ReplayBuffer::Snapshot(Ticks100ns window, const PacketSink& sink,
+                              Ticks100ns* covered_to) const {
+    std::scoped_lock lock(mutex_);
+    if (video_.empty()) return Status::Fail("replay buffer is empty");
+    if (covered_to) *covered_to = video_.back().pts;
 
     for (const Segment& segment : segments_)
         if (segment.write_file) std::fflush(segment.write_file);
 
 
     const Ticks100ns newest = video_.back().pts;
-    const Ticks100ns wanted = newest - std::min(window, window_);
-
-    auto start = video_.begin();
-    for (auto it = video_.begin(); it != video_.end(); ++it) {
-        if (it->keyframe && it->pts <= wanted) start = it;
-        if (it->pts > wanted) break;
-    }
-
+    const auto start = ClipStartLocked(window);
     const Ticks100ns base = start->pts;
 
     std::vector<const Entry*> wanted_entries;
@@ -288,7 +291,7 @@ std::vector<PacketPtr> ReplayBuffer::Snapshot(Ticks100ns window) const {
     std::unordered_map<std::uint32_t, const Segment*> readers;
     for (const Segment& segment : segments_) readers[segment.id] = &segment;
 
-    out.reserve(wanted_entries.size());
+    std::size_t delivered = 0;
     for (const Entry* entry : wanted_entries) {
         const auto reader = readers.find(entry->segment);
         if (reader == readers.end() || !reader->second) continue;
@@ -317,12 +320,46 @@ std::vector<PacketPtr> ReplayBuffer::Snapshot(Ticks100ns window) const {
             RF_WARN("replay spool read failed - clip will be short");
             break;
         }
-        out.push_back(std::move(packet));
+        RF_TRY(sink(std::move(packet)));
+        ++delivered;
     }
 
-    RF_INFO("replay snapshot: {} packets, {:.1f}s, {:.0f} MB read back", out.size(),
+    RF_INFO("replay snapshot: {} packets, {:.1f}s, {:.0f} MB buffered", delivered,
             Ticks100nsToMs(newest - base) / 1000.0, bytes_ / 1048576.0);
-    return out;
+    return delivered ? Status::Ok() : Status::Fail("replay buffer is empty");
+}
+
+std::deque<ReplayBuffer::Entry>::const_iterator ReplayBuffer::ClipStartLocked(
+    Ticks100ns window) const {
+    const Ticks100ns wanted = video_.back().pts - std::min(window, window_);
+    auto start = video_.begin();
+    for (auto it = video_.begin(); it != video_.end(); ++it) {
+        if (it->keyframe && it->pts <= wanted) start = it;
+        if (it->pts > wanted) break;
+    }
+    return start;
+}
+
+Ticks100ns ReplayBuffer::ClipStart(Ticks100ns window) const {
+    std::scoped_lock lock(mutex_);
+    return video_.empty() ? 0 : ClipStartLocked(window)->pts;
+}
+
+void ReplayBuffer::DropThrough(Ticks100ns pts) {
+    std::scoped_lock lock(mutex_);
+
+    while (!video_.empty() && (video_.front().pts <= pts || !video_.front().keyframe)) {
+        bytes_ -= video_.front().size;
+        ReleaseSegment(video_.front().segment);
+        video_.pop_front();
+    }
+
+    const Ticks100ns floor = video_.empty() ? pts : video_.front().pts;
+    while (!audio_.empty() && audio_.front().pts < floor) {
+        bytes_ -= audio_.front().size;
+        ReleaseSegment(audio_.front().segment);
+        audio_.pop_front();
+    }
 }
 
 ReplayBuffer::Stats ReplayBuffer::GetStats() const {

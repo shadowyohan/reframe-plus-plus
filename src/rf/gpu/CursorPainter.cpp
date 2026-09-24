@@ -114,8 +114,16 @@ bool RasterizeCursor(HICON icon, int width, int height, std::vector<std::uint32_
 Status CursorPainter::Init(const D3DDevicePtr& device, std::uint32_t width, std::uint32_t height,
                            DXGI_FORMAT format) {
     device_ = device;
+    RF_TRY(CreatePool(width, height, format));
+    RF_TRY(EnsurePipeline());
+    RF_INFO("cursor painter up: {}x{}", width, height);
+    return Status::Ok();
+}
+
+Status CursorPainter::CreatePool(std::uint32_t width, std::uint32_t height, DXGI_FORMAT format) {
     width_ = width;
     height_ = height;
+    format_ = format;
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = width;
@@ -131,9 +139,6 @@ Status CursorPainter::Init(const D3DDevicePtr& device, std::uint32_t width, std:
         RF_HR(device_->device()->CreateTexture2D(&td, nullptr, &pool_[i]));
         RF_HR(device_->device()->CreateRenderTargetView(pool_[i].Get(), nullptr, &pool_rtv_[i]));
     }
-
-    RF_TRY(EnsurePipeline());
-    RF_INFO("cursor painter up: {}x{}", width, height);
     return Status::Ok();
 }
 
@@ -234,6 +239,13 @@ Status CursorPainter::EnsureShape(void* hcursor) {
 Status CursorPainter::Compose(ID3D11Texture2D* frame, std::int32_t origin_x, std::int32_t origin_y,
                               ID3D11Texture2D** out) {
     if (!frame || !out) return Status::Fail(E_POINTER, "CursorPainter::Compose");
+
+    D3D11_TEXTURE2D_DESC incoming{};
+    frame->GetDesc(&incoming);
+    if (incoming.Width != width_ || incoming.Height != height_ || incoming.Format != format_) {
+        RF_INFO("cursor painter follows the display to {}x{}", incoming.Width, incoming.Height);
+        RF_TRY(CreatePool(incoming.Width, incoming.Height, incoming.Format));
+    }
 
     const int slot = next_;
     next_ = (next_ + 1) % kPoolSize;

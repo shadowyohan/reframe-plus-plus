@@ -59,7 +59,7 @@ private:
 
     ID3D11Device* device_ = nullptr;
     std::unordered_map<std::string, Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> textures_;
-    std::deque<std::string> order_;
+    mutable std::deque<std::string> order_;
 };
 
 }

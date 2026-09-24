@@ -19,12 +19,14 @@ public:
                    ID3D11Texture2D** out);
 
 private:
+    Status CreatePool(std::uint32_t width, std::uint32_t height, DXGI_FORMAT format);
     Status EnsurePipeline();
     Status EnsureShape(void* hcursor);
 
     D3DDevicePtr device_;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
+    DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN;
 
     static constexpr int kPoolSize = 4;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> pool_[kPoolSize];

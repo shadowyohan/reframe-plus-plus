@@ -1,5 +1,6 @@
 #include <windows.h>
 
+#include <dbghelp.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj_core.h>
@@ -23,6 +24,8 @@
 
 #include "resource.h"
 
+#include "rf/audio/MaxineSetup.h"
+#include "rf/audio/NoiseSuppressor.h"
 #include "rf/core/Lang.h"
 #include "rf/core/Log.h"
 #include "rf/core/Paths.h"
@@ -151,19 +154,10 @@ std::vector<MicDevice> EnumerateMics() {
     return out;
 }
 
-void DiskUsage(const std::filesystem::path& dir, std::uint64_t& used, std::uint64_t& total) {
+std::uint64_t VolumeSize(const std::filesystem::path& dir) {
     ULARGE_INTEGER free_bytes{}, total_bytes{}, total_free{};
-    if (::GetDiskFreeSpaceExW(dir.c_str(), &free_bytes, &total_bytes, &total_free))
-        total = total_bytes.QuadPart;
-
-    std::uint64_t recordings = 0;
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (!entry.is_regular_file(ec)) continue;
-        const auto size = entry.file_size(ec);
-        if (!ec) recordings += size;
-    }
-    used = recordings;
+    if (!::GetDiskFreeSpaceExW(dir.c_str(), &free_bytes, &total_bytes, &total_free)) return 0;
+    return total_bytes.QuadPart;
 }
 
 struct App {
@@ -176,6 +170,9 @@ struct App {
     rf::ui::AppModel model;
 
     rf::VideoPlayer player;
+    rf::MaxineSetup maxine;
+    std::atomic<bool> maxine_finished{false};
+    std::atomic<bool> maxine_succeeded{false};
 
     NOTIFYICONDATAW tray{};
     HWND tray_hwnd = nullptr;
@@ -201,6 +198,7 @@ struct App {
     std::atomic<bool> engine_running{false};
     std::atomic<bool> needs_rebind{false};
     std::atomic<bool> pending_rebind{false};
+    std::atomic<bool> encoder_recovering{false};
 
     std::atomic<const char*> stage{"idle"};
     std::atomic<std::uint64_t> ticks{0};
@@ -222,6 +220,20 @@ void PostEngine(std::function<void()> task) {
     app.task_cv.notify_one();
 }
 
+bool WriteHangDump() {
+    const auto path = rf::paths::LogDir() / L"hang.dmp";
+    HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    const auto kind =
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules);
+    const bool written = ::MiniDumpWriteDump(::GetCurrentProcess(), ::GetCurrentProcessId(), file,
+                                             kind, nullptr, nullptr, nullptr) != FALSE;
+    ::CloseHandle(file);
+    return written;
+}
+
 void WatchdogLoop() {
     App& app = *g_app;
     ::SetThreadDescription(::GetCurrentThread(), L"rf-watchdog");
@@ -240,31 +252,55 @@ void WatchdogLoop() {
                      app.stage.load(std::memory_order_relaxed), seconds);
     };
 
+    constexpr int kSampleMs = 250;
+    constexpr int kStallMs = 1500;
+    constexpr int kDumpMs = 3000;
+    constexpr int kHeartbeatMs = 5000;
+
     std::uint64_t last_tick = 0;
-    int stalled_for = 0;
+    int stalled_ms = 0;
     bool reported = false;
-    int since_heartbeat = 0;
+    bool dumped = false;
+    bool os_says_hung = false;
+    int since_heartbeat_ms = 0;
 
     while (app.engine_running.load(std::memory_order_relaxed)) {
-        ::Sleep(1000);
+        ::Sleep(kSampleMs);
         const std::uint64_t tick = app.ticks.load(std::memory_order_relaxed);
 
+        if (const bool hung_now = ::IsHungAppWindow(app.overlay.hwnd()) != FALSE;
+            hung_now != os_says_hung) {
+            os_says_hung = hung_now;
+            stamp(hung_now ? "OS-HUNG" : "OS-OK", tick, stalled_ms / 1000);
+            if (hung_now && !dumped) {
+                dumped = true;
+                stamp(WriteHangDump() ? "DUMPED" : "DUMP-FAIL", tick, stalled_ms / 1000);
+            }
+        }
+
         if (tick != last_tick) {
-            if (reported) stamp("RECOVERED", tick, stalled_for);
+            if (reported) stamp("RECOVERED", tick, stalled_ms / 1000);
             last_tick = tick;
-            stalled_for = 0;
+            stalled_ms = 0;
             reported = false;
 
-            if (++since_heartbeat >= 5) {
-                since_heartbeat = 0;
+            since_heartbeat_ms += kSampleMs;
+            if (since_heartbeat_ms >= kHeartbeatMs) {
+                since_heartbeat_ms = 0;
                 stamp("alive", tick, 0);
             }
             continue;
         }
 
-        if (++stalled_for >= 2 && !reported) {
+        stalled_ms += kSampleMs;
+        if (stalled_ms >= kStallMs && !reported) {
             reported = true;
-            stamp("STALLED", tick, stalled_for);
+            stamp("STALLED", tick, stalled_ms / 1000);
+        }
+
+        if (stalled_ms >= kDumpMs && !dumped) {
+            dumped = true;
+            stamp(WriteHangDump() ? "DUMPED" : "DUMP-FAIL", tick, stalled_ms / 1000);
         }
     }
     stamp("shutdown", app.ticks.load(std::memory_order_relaxed), 0);
@@ -490,6 +526,10 @@ void FollowCursorAcrossMonitors() {
         refused = static_cast<HMONITOR>(denied);
 }
 
+void WaitForInputOrTimeout(DWORD milliseconds) {
+    ::MsgWaitForMultipleObjectsEx(0, nullptr, milliseconds, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+}
+
 bool ForegroundOwnsTheScreen() {
     HWND foreground = ::GetForegroundWindow();
     if (!foreground || foreground == g_app->overlay.hwnd()) return false;
@@ -497,6 +537,12 @@ bool ForegroundOwnsTheScreen() {
     DWORD pid = 0;
     ::GetWindowThreadProcessId(foreground, &pid);
     if (pid == ::GetCurrentProcessId()) return false;
+
+    wchar_t window_class[16] = {};
+    ::GetClassNameW(foreground, window_class, ARRAYSIZE(window_class));
+    if (std::wstring_view(window_class) == L"Progman" ||
+        std::wstring_view(window_class) == L"WorkerW")
+        return false;
 
     RECT window{};
     if (!::GetWindowRect(foreground, &window)) return false;
@@ -520,14 +566,25 @@ void RefreshMonitors() {
     App& app = *g_app;
     app.model.monitors.clear();
     const auto monitors = rf::EnumerateMonitors();
+    bool configured_attached = app.settings.capture_monitor.empty();
+
     for (std::size_t i = 0; i < monitors.size(); ++i) {
         const rf::MonitorInfo& m = monitors[i];
+        std::string device_name = rf::ToUtf8(m.device_name);
+        configured_attached = configured_attached || device_name == app.settings.capture_monitor;
 
         app.model.monitors.push_back(
             {std::format("{}. {} - {}x{}{}", i + 1, rf::ToUtf8(m.description), m.width, m.height,
                          m.primary ? " (основной)" : ""),
-             rf::ToUtf8(m.device_name)});
+             std::move(device_name)});
     }
+
+    if (configured_attached) return;
+
+    RF_WARN("the display \"{}\" is gone - recording the primary one from now on",
+            app.settings.capture_monitor);
+    app.settings.capture_monitor.clear();
+    SettingsTouched();
 }
 
 void PickMicDevice(const std::string& id) {
@@ -618,11 +675,16 @@ void ApplyReplayState() {
     const bool already =
         armed ? app.recorder.state() != rf::Recorder::State::Idle : app.recorder.state() == rf::Recorder::State::Idle;
     app.replay_pending = false;
-    if (already) return;
-
     app.settings.Save(rf::paths::SettingsFile());
-    PostEngine([armed] {
+
+    const rf::Settings snapshot = app.settings;
+    PostEngine([armed, already, snapshot] {
     App& app = *g_app;
+
+    if (auto s = app.recorder.ApplySettings(snapshot); !s.ok())
+        RF_ERROR("applying the replay switch: {}", s.str());
+
+    if (already) return;
 
     if (armed) {
         if (auto s = app.recorder.ArmReplay(); !s.ok()) {
@@ -639,6 +701,27 @@ void ApplyReplayState() {
         app.recorder.DisarmReplay();
         app.hud.Push(rf::ui::Hud::Kind::ReplayArmed, "Мгновенный повтор выключен");
     }
+    });
+}
+
+void RecoverFromEncoderFailure() {
+    PostEngine([] {
+        App& app = *g_app;
+        const bool was_recording = app.recorder.state() == rf::Recorder::State::Recording;
+
+        const rf::Status recovered = app.recorder.RecoverEncoder();
+        if (!recovered.ok()) {
+            RF_ERROR("encoder recovery: {}", recovered.str());
+            app.hud.Push(rf::ui::Hud::Kind::Error,
+                         "Кодировщик видеокарты отказал — включите откаты заново");
+        } else if (was_recording) {
+            app.hud.Push(rf::ui::Hud::Kind::Error,
+                         "Кодировщик видеокарты перезапущен — запись остановлена");
+        } else {
+            app.hud.Push(rf::ui::Hud::Kind::Error, "Кодировщик видеокарты перезапущен");
+        }
+        if (was_recording) app.gallery.Refresh();
+        app.encoder_recovering = false;
     });
 }
 
@@ -736,12 +819,54 @@ HWND CreateTrayWindow(HINSTANCE instance) {
                              instance, nullptr);
 }
 
+constexpr wchar_t kElevatedTaskName[] = L"reframe++";
+constexpr wchar_t kLaunchedByTaskFlag[] = L"--from-task";
+
+bool IsElevated() {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    const bool elevated = ::GetTokenInformation(token, TokenElevation, &elevation,
+                                                sizeof(elevation), &size) &&
+                          elevation.TokenIsElevated;
+    ::CloseHandle(token);
+    return elevated;
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+bool RelaunchThroughElevatedTask() {
+    wchar_t system_dir[MAX_PATH]{};
+    if (!::GetSystemDirectoryW(system_dir, MAX_PATH)) return false;
+    std::wstring command =
+        std::format(L"\"{}\\schtasks.exe\" /run /tn \"{}\"", system_dir, kElevatedTaskName);
+
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (!::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                          nullptr, nullptr, &startup, &process)) {
+        return false;
+    }
+    ::CloseHandle(process.hThread);
+    DWORD exit_code = 1;
+    if (::WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0) {
+        ::GetExitCodeProcess(process.hProcess, &exit_code);
+    }
+    ::CloseHandle(process.hProcess);
+    return exit_code == 0;
+}
+
+}
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     rf::log::Init(rf::log::Level::Info);
     ::AddVectoredExceptionHandler(1, CrashReporter);
+
+    const bool launched_by_task = command_line && std::wcsstr(command_line, kLaunchedByTaskFlag);
+    if (!launched_by_task && !IsElevated()) {
+        if (RelaunchThroughElevatedTask()) return 0;
+        RF_WARN("elevated task unavailable - running without raised GPU priority");
+    }
 
     HANDLE single = ::CreateMutexW(nullptr, TRUE, L"Local\\ReframePlusPlusSingleton");
     if (single && ::GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -872,10 +997,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     };
 
     app.model.gpus.push_back({"Авто", 0, 0});
-    for (const rf::AdapterInfo& info : rf::EnumerateAdapters()) {
-        if (info.is_software) continue;
-        app.model.gpus.push_back(
-            {rf::ToUtf8(info.description), info.luid_low, info.luid_high});
+    {
+        const auto adapters = rf::EnumerateSelectableAdapters();
+        for (std::size_t i = 0; i < adapters.size(); ++i) {
+            const auto same_name = [&](const rf::AdapterInfo& other) {
+                return other.description == adapters[i].description;
+            };
+            std::string name = rf::ToUtf8(adapters[i].description);
+            if (std::count_if(adapters.begin(), adapters.end(), same_name) > 1)
+                name += std::format(
+                    " #{}", 1 + std::count_if(adapters.begin(), adapters.begin() + i, same_name));
+
+            app.model.gpus.push_back({name, adapters[i].luid_low, adapters[i].luid_high});
+        }
     }
 
     RefreshMonitors();
@@ -901,13 +1035,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return PickFolder(g_app->overlay.hwnd(), p);
     };
     app.model.on_close = [] { g_app->menu.Close(); };
+    app.model.maxine_installed = rf::MaxineInstalled();
+    app.maxine.on_finished = [](const rf::Status& result) {
+        g_app->maxine_succeeded = result.ok();
+        g_app->maxine_finished = true;
+    };
+    app.model.on_download_maxine = [] {
+        if (auto s = g_app->maxine.Start(rf::paths::DataDir() / L"downloads"); !s.ok())
+            g_app->hud.Push(rf::ui::Hud::Kind::Error, "NVIDIA Maxine работает только на видеокартах RTX");
+    };
 
     app.engine_running = true;
     app.engine = std::thread(EngineLoop);
 
     if (app.settings.replay_enabled) SetReplayArmed(true);
 
-    RF_INFO("reframe++ 1.2.0 build 615, compiled {} {}", __DATE__, __TIME__);
+    RF_INFO("reframe++ 2.0 build 971, compiled {} {}", __DATE__, __TIME__);
     RF_INFO("reframe++ ready - Alt+Z opens the overlay");
 
     app.watchdog = std::thread(WatchdogLoop);
@@ -940,8 +1083,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (poll_tick) {
             last_poll = now_poll;
             app.stage = "disk-usage";
-            DiskUsage(app.settings.output_dir, app.model.disk_used_bytes,
-                      app.model.disk_total_bytes);
+            app.model.disk_used_bytes = app.gallery.total_bytes();
+            app.model.disk_total_bytes = VolumeSize(app.settings.output_dir);
 
             DWM_TIMING_INFO timing{};
             timing.cbSize = sizeof(timing);
@@ -979,6 +1122,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         badges.scale = app.settings.hud_badge_scale;
         badges.opacity = app.settings.hud_opacity;
         app.hud.SetBadges(badges);
+
+        for (std::string& name : app.recorder.TakeOverflowedApps())
+            app.hud.PushTrackLimit(std::move(name));
+
+        app.model.maxine_downloading = app.maxine.running();
+        if (app.maxine.running()) {
+            const float progress = app.maxine.progress();
+            app.hud.SetDownload(progress < 1.0f ? "Скачиваю NVIDIA Maxine" : "Устанавливаю NVIDIA Maxine",
+                                "NVIDIA Maxine", progress);
+        }
+        if (app.maxine_finished.exchange(false)) {
+            app.hud.EndDownload();
+            app.model.maxine_installed = rf::MaxineInstalled();
+            if (app.maxine_succeeded) {
+                PostEngine([] {
+                    if (auto s = g_app->recorder.RebuildPipeline(); !s.ok())
+                        RF_WARN("rebuilding after the Maxine install: {}", s.str());
+                });
+            } else {
+                app.hud.Push(rf::ui::Hud::Kind::Error, "Не удалось установить NVIDIA Maxine");
+            }
+        }
 
         if (now_poll - app.gallery_polled > rf::kOneSecond100ns / 5) {
             app.gallery_polled = now_poll;
@@ -1066,12 +1231,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
         app.overlay.SetClickable(over_pill);
 
+        if (app.pending_rebind.exchange(false)) {
+            if (auto s = app.overlay.RebindDevice(app.recorder.device()); !s.ok()) {
+                RF_ERROR("overlay recovery failed: {}", s.str());
+                app.quit = true;
+            }
+        }
+
+        if (app.overlay.device_lost() || (app.recorder.device() && !app.recorder.device()->alive()))
+            RecoverFromDeviceLoss();
+
+        if (app.recorder.encoder_failed() && !app.encoder_recovering.exchange(true))
+            RecoverFromEncoderFailure();
+
         const bool anything_visible = app.menu.visible() || app.hud.busy();
         app.stage = "visibility";
         app.overlay.SetVisible(anything_visible);
         if (!anything_visible) {
             app.stage = "idle";
-            ::Sleep(20);
+            WaitForInputOrTimeout(20);
             continue;
         }
 
@@ -1092,17 +1270,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                 app.overlay.SetShape(app.hud.hit_rects());
         }
 
-        if (app.pending_rebind.exchange(false)) {
-            if (auto s = app.overlay.RebindDevice(app.recorder.device()); !s.ok()) {
-                RF_ERROR("overlay recovery failed: {}", s.str());
-                app.quit = true;
-            }
-        }
-
-        if (app.overlay.device_lost() || (app.recorder.device() && !app.recorder.device()->alive()))
-            RecoverFromDeviceLoss();
-
-        ::Sleep(4);
+        WaitForInputOrTimeout(4);
     }
 
     RF_INFO("shutting down (quit={}, pump alive={})", app.quit, app.overlay.hwnd() != nullptr);

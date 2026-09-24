@@ -7,6 +7,8 @@
 #include <mutex>
 
 #include "rf/audio/AacEncoder.h"
+#include "rf/audio/AppAudioTracks.h"
+#include "rf/audio/NoiseSuppressor.h"
 #include "rf/audio/WasapiCapture.h"
 #include "rf/capture/GameCapture.h"
 #include "rf/capture/GameWatcher.h"
@@ -42,6 +44,7 @@ public:
     void Shutdown();
 
     Status ApplySettings(const Settings& settings);
+    Status RebuildPipeline();
 
     Status ArmReplay();
     void DisarmReplay();
@@ -50,6 +53,9 @@ public:
 
     Status StartRecording(const std::filesystem::path& file);
     Status StopRecording();
+
+    [[nodiscard]] bool encoder_failed() const { return encoder_failed_.load(); }
+    Status RecoverEncoder();
 
     [[nodiscard]] State state() const { return state_.load(); }
 
@@ -68,6 +74,8 @@ public:
                           std::uint32_t height, bool visible);
     [[nodiscard]] const Settings& settings() const { return settings_; }
 
+    std::vector<std::string> TakeOverflowedApps() { return app_tracks_.TakeOverflowedApps(); }
+
     [[nodiscard]] static bool PacerAccepts(Ticks100ns timestamp, Ticks100ns deadline,
                                            Ticks100ns period) {
         return timestamp + period / 2 >= deadline;
@@ -83,7 +91,9 @@ public:
 private:
 
     Status ArmReplayLocked();
+    Status StopRecordingLocked();
     Status SetCaptureMonitorLocked(void* hmonitor);
+    void NoteSubmit(const Status& submitted);
 
     Status StartDisplayCapture(const CaptureTarget& target, const FrameCallback& on_frame,
                                VideoCapturePtr& out);
@@ -109,6 +119,15 @@ private:
 
     void OnSystemAudio(const AudioChunk& chunk);
     void OnMicAudio(const AudioChunk& chunk);
+    [[nodiscard]] std::uint32_t AudioTrackCount() const;
+    [[nodiscard]] bool MicInMainTrack() const;
+    [[nodiscard]] std::uint32_t FirstAppTrack() const;
+    [[nodiscard]] std::vector<std::uint32_t> AudibleAudioTracks(Ticks100ns since) const;
+    [[nodiscard]] std::vector<std::string> AudioTrackNames(
+        const std::vector<std::uint32_t>& tracks) const;
+    void FinishRecordingInBackground(std::filesystem::path file,
+                                     std::vector<std::uint32_t> kept_tracks,
+                                     std::vector<std::string> names, bool drop_silent);
 
     Settings settings_;
     D3DDevicePtr device_;
@@ -135,6 +154,8 @@ private:
 
     std::mutex mux_mutex_;
     std::unique_ptr<Mp4Muxer> muxer_;
+    Ticks100ns recording_from_ = 0;
+    std::thread trimmer_;
 
     std::thread writer_;
     std::atomic<bool> writing_{false};
@@ -148,6 +169,10 @@ private:
 
     bool arm_requested_ = false;
     std::atomic<bool> encoder_ready_{false};
+    bool force_software_encoder_ = false;
+    Ticks100ns last_encoder_recovery_ = 0;
+    std::atomic<std::uint64_t> submit_failures_{0};
+    std::atomic<bool> encoder_failed_{false};
 
     std::mutex pace_mutex_;
     Ticks100ns last_pts_ = 0;
@@ -169,10 +194,14 @@ private:
     std::unique_ptr<AacEncoder> aac_;
 
     std::unique_ptr<AacEncoder> aac_mic_;
+    std::unique_ptr<AacEncoder> aac_system_;
+    AppAudioTracks app_tracks_;
+    MicDenoiser denoiser_;
     std::mutex mic_mutex_;
     std::vector<float> mic_fifo_;
     std::vector<float> mix_scratch_;
     std::vector<float> mic_scratch_;
+    std::vector<float> mic_gained_;
     std::atomic<float> system_volume_{1.0f};
     std::atomic<float> mic_volume_{1.0f};
     VideoFormat video_format_{};

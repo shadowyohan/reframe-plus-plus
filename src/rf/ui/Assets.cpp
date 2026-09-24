@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <fstream>
 #include <vector>
 
@@ -227,6 +228,7 @@ void FontSet::Load(ImGuiIO& io, const std::filesystem::path& dir, float dpi_scal
     fonts_[static_cast<int>(Font::Tiny)] = add(embedded_regular, regular, 13.0f);
     fonts_[static_cast<int>(Font::Toast)] = add(embedded_wide, wide, 16.0f);
     fonts_[static_cast<int>(Font::Warning)] = add(embedded_regular, regular, 17.0f);
+    fonts_[static_cast<int>(Font::WarningBold)] = add(embedded_wide_bold, wide_bold, 17.0f);
 
     io.Fonts->Build();
 }
@@ -256,6 +258,11 @@ ImTextureID TextureCache::FromRgba(const std::string& key, const std::uint8_t* p
 ImTextureID TextureCache::Find(const std::string& key) const {
     const auto it = textures_.find(key);
     if (it == textures_.end()) return ImTextureID{};
+
+    if (const auto used = std::find(order_.begin(), order_.end(), key); used != order_.end()) {
+        order_.erase(used);
+        order_.push_back(key);
+    }
     return reinterpret_cast<ImTextureID>(it->second.Get());
 }
 

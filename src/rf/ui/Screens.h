@@ -25,7 +25,7 @@ struct AppModel {
     std::uint64_t disk_used_bytes = 0;
     std::uint64_t disk_total_bytes = 0;
     std::string mic_device_label = "Системный по умолчанию";
-    std::string build_line = "reframe++ 1.2.0 © | Build: 615. All rights reserved";
+    std::string build_line = "reframe++ 2.0 © | Build: 971. All rights reserved";
 
     std::string record_hotkey = "ALT+F9";
     std::string replay_hotkey = "ALT+F10";
@@ -49,6 +49,10 @@ struct AppModel {
         std::string device_name;
     };
     std::vector<MonitorOption> monitors;
+
+    bool maxine_installed = false;
+    bool maxine_downloading = false;
+    std::function<void()> on_download_maxine;
 
     std::function<void()> on_toggle_record;
     std::function<void(const std::string&)> on_pick_mic;
@@ -114,6 +118,7 @@ private:
     Page page_ = Page::Main;
     Page previous_page_ = Page::Main;
     bool mic_list_open_ = false;
+    bool noise_list_open_ = false;
     bool gpu_list_open_ = false;
     bool monitor_list_open_ = false;
 

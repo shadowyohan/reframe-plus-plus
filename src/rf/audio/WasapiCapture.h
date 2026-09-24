@@ -18,6 +18,7 @@ namespace rf {
 enum class AudioSource {
     SystemLoopback,
     Microphone,
+    Application,
 };
 
 struct AudioChunk {
@@ -36,6 +37,7 @@ public:
 
     Status Start(AudioSource source, const AudioCallback& on_audio,
                  const std::string& device_id = {});
+    Status StartApplication(std::uint32_t process_id, const AudioCallback& on_audio);
     void Stop();
 
     [[nodiscard]] AudioFormat format() const { return format_; }
@@ -43,10 +45,11 @@ public:
     [[nodiscard]] std::uint64_t silence_filled() const { return silence_filled_; }
 
 private:
+    Status InitializeClient(AudioSource source);
     void CaptureLoop();
 
     Microsoft::WRL::ComPtr<IMMDevice> device_;
-    Microsoft::WRL::ComPtr<IAudioClient3> client_;
+    Microsoft::WRL::ComPtr<IAudioClient> client_;
     Microsoft::WRL::ComPtr<IAudioCaptureClient> capture_;
     HANDLE event_ = nullptr;
 

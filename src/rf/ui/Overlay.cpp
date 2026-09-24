@@ -26,6 +26,13 @@ bool SystemCursorVisible() {
 }
 
 constexpr const wchar_t* kClassName = L"ReframeOverlay";
+
+constexpr int kNotFullscreenMargin = 1;
+
+SIZE OverlaySize() {
+    return {::GetSystemMetrics(SM_CXSCREEN),
+            ::GetSystemMetrics(SM_CYSCREEN) - kNotFullscreenMargin};
+}
 }
 
 Overlay::~Overlay() { Destroy(); }
@@ -84,11 +91,12 @@ LRESULT Overlay::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
         case WM_DISPLAYCHANGE:
 
-            Resize(static_cast<UINT>(::GetSystemMetrics(SM_CXSCREEN)),
-                   static_cast<UINT>(::GetSystemMetrics(SM_CYSCREEN)));
-            ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, ::GetSystemMetrics(SM_CXSCREEN),
-                           ::GetSystemMetrics(SM_CYSCREEN), SWP_NOACTIVATE);
+        {
+            const SIZE size = OverlaySize();
+            Resize(static_cast<UINT>(size.cx), static_cast<UINT>(size.cy));
+            ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, size.cx, size.cy, SWP_NOACTIVATE);
             return 0;
+        }
 
         case WM_CLOSE:
             RF_WARN("overlay received WM_CLOSE");
@@ -150,8 +158,9 @@ Status Overlay::Create(const D3DDevicePtr& device, const std::filesystem::path& 
     wc.lpszClassName = kClassName;
     ::RegisterClassExW(&wc);
 
-    width_ = static_cast<UINT>(::GetSystemMetrics(SM_CXSCREEN));
-    height_ = static_cast<UINT>(::GetSystemMetrics(SM_CYSCREEN));
+    const SIZE size = OverlaySize();
+    width_ = static_cast<UINT>(size.cx);
+    height_ = static_cast<UINT>(size.cy);
 
     const DWORD ex_style =
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE;
@@ -160,6 +169,7 @@ Status Overlay::Create(const D3DDevicePtr& device, const std::filesystem::path& 
                               static_cast<int>(width_), static_cast<int>(height_), nullptr, nullptr,
                               instance_, this);
     if (!hwnd_) return Status::Fail(HRESULT_FROM_WIN32(::GetLastError()), "CreateWindowEx");
+    ::SetPropW(hwnd_, L"NonRudeHWND", reinterpret_cast<HANDLE>(TRUE));
 
     dpi_scale_ = static_cast<float>(::GetDpiForWindow(hwnd_)) / 96.0f;
 

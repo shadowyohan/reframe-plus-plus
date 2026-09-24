@@ -24,6 +24,7 @@ struct AdapterInfo {
     std::uint32_t vendor_id = 0;
     std::uint32_t device_id = 0;
     std::uint64_t dedicated_vram = 0;
+    std::uint32_t output_count = 0;
     std::int32_t luid_low = 0;
     std::int32_t luid_high = 0;
 
@@ -33,6 +34,8 @@ struct AdapterInfo {
 };
 
 std::vector<AdapterInfo> EnumerateAdapters();
+
+std::vector<AdapterInfo> EnumerateSelectableAdapters();
 
 struct MonitorInfo {
     std::wstring device_name;

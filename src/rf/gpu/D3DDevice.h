@@ -40,14 +40,14 @@ public:
         ID3D11Multithread* mt_;
     };
 
-    void SetLowGpuPriority();
-
     [[nodiscard]] HRESULT DeviceRemovedReason() const;
     [[nodiscard]] bool alive() const { return DeviceRemovedReason() == S_OK; }
 
     static const char* DescribeRemovedReason(HRESULT reason);
 
 private:
+    void RaiseGpuPriority();
+
     Microsoft::WRL::ComPtr<ID3D11Device5> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context_;
     Microsoft::WRL::ComPtr<ID3D11Multithread> multithread_;

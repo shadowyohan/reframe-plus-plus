@@ -4,6 +4,7 @@
 
 #include "rf/capture/IVideoCapture.h"
 #include "rf/core/Lang.h"
+#include "rf/audio/NoiseSuppressor.h"
 #include "rf/core/Media.h"
 #include "rf/encode/IVideoEncoder.h"
 
@@ -11,6 +12,8 @@ namespace rf {
 
 inline constexpr float kUiScaleMin = 0.5f;
 inline constexpr float kUiScaleMax = 2.0f;
+
+inline constexpr std::uint32_t kAudioTracksPerApp = 2;
 
 struct Settings {
 
@@ -73,6 +76,12 @@ struct Settings {
     std::uint32_t audio_tracks = 0;
     [[nodiscard]] bool separate_audio_tracks() const { return audio_tracks != 0; }
 
+    [[nodiscard]] bool app_audio_tracks() const { return audio_tracks == kAudioTracksPerApp; }
+    std::uint32_t app_track_slots = 6;
+
+    bool mic_noise_suppression = false;
+    NoiseSuppression noise_suppression = NoiseSuppression::RNNoise;
+
     bool disk_limit_enabled = true;
     std::uint32_t disk_limit_gb = 200;
     std::filesystem::path temp_dir;
@@ -117,7 +126,13 @@ inline constexpr const char* kResolutionNames[] = {"Экран", "720p HD", "108
 inline constexpr std::uint32_t kResolutionHeights[] = {0, 720, 1080, 1440, 2160};
 inline constexpr const char* kFpsNames[] = {"30 FPS", "60 FPS", "120 FPS", "144 FPS"};
 inline constexpr std::uint32_t kFpsValues[] = {30, 60, 120, 144};
-inline constexpr const char* kAudioTrackNames[] = {"Одна дорожка", "Раздельно"};
+inline constexpr const char* kAudioTrackNames[] = {"Одна дорожка", "Раздельно",
+                                                   "По приложениям"};
+
+inline constexpr std::uint32_t kAppTrackSlotsMin = 6;
+inline constexpr std::uint32_t kAppTrackSlotsMax = 20;
+
+inline constexpr const char* kNoiseSuppressionNames[] = {"RNNoise", "Speex", "NVIDIA Maxine"};
 
 inline constexpr const char* kHudCornerNames[] = {"Слева сверху", "Справа сверху", "Слева снизу",
                                                   "Справа снизу"};

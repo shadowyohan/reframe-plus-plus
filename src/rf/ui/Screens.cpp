@@ -520,6 +520,8 @@ void Menu::PageMain(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel
                                         static_cast<int>(item.thumb_width),
                                         static_cast<int>(item.thumb_height));
                 model.gallery->MarkUploaded(item.path);
+            } else if (!tex && item.thumb_uploaded) {
+                model.gallery->ReloadThumbnail(item.path);
             }
 
             if (tex)
@@ -1120,6 +1122,100 @@ void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
         volume_row("a-gain", "activity", "Усиление", "Дополнительный буст голоса", s.mic_gain,
                    s.record_microphone);
 
+        {
+            const ImVec2 pos = col.Next(kRowH_TwoLine);
+            Interaction row = Row(ctx, HashId("a-ns"), pos, ImVec2(col.w, kRowH_TwoLine));
+            RowIcon(ctx, row, pos, "voice-square");
+            RowTitle(ctx, pos, "Шумоподавление");
+            RowSubtitle(ctx, pos, "Шумоподавление микрофона", 41.0f);
+
+            bool on = s.mic_noise_suppression;
+            if (Toggle(ctx, HashId("a-ns-t"), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f), on)) {
+                s.mic_noise_suppression = on;
+                dirty = true;
+            }
+        }
+
+        if (s.mic_noise_suppression) {
+            const bool maxine_missing =
+                s.noise_suppression == NoiseSuppression::Maxine && !model.maxine_installed;
+            constexpr float kItemH = 36.0f;
+            const int mode_count = static_cast<int>(std::size(kNoiseSuppressionNames));
+            const float row_h =
+                kRowH_TwoLine + (noise_list_open_ ? mode_count * kItemH + 10.0f : 0.0f);
+            const ImVec2 pos = col.Next(row_h);
+            ctx.dl->AddRectFilled(ctx.At(pos), ctx.At(ImVec2(pos.x + col.w, pos.y + row_h)),
+                                  ctx.Fade(kRowBg), kRowRadius);
+
+            Interaction head =
+                Hit(ctx, HashId("a-ns-mode"), pos, ImVec2(pos.x + col.w, pos.y + kRowH_TwoLine));
+            RowIcon(ctx, head, pos, "voice-square");
+            RowTitle(ctx, pos, "Режим шумоподавления");
+            const auto mode = static_cast<std::size_t>(s.noise_suppression);
+            RowSubtitle(ctx, pos, kNoiseSuppressionNames[mode], 41.0f);
+            if (maxine_missing) {
+                const float title_w = MeasureText(ctx, Font::Body, "Режим шумоподавления").x;
+                DrawIcon(ctx, "danger", ImVec2(pos.x + kRowTextX + title_w + 8.0f, pos.y + 12.0f),
+                         20.0f, kWarnAmber);
+            }
+
+            Spring& turn = ctx.anim->Get(HashId("a-ns-turn"));
+            turn.SetTarget(noise_list_open_ ? 1.0f : 0.0f);
+            const float t = turn.Update(ctx.dt, spring::kMenu);
+            const ImVec2 ch_center(pos.x + col.w - 28.0f, pos.y + kRowH_TwoLine * 0.5f);
+            const float c = std::cos(t * 1.5707963f), sn = std::sin(t * 1.5707963f);
+            auto rot = [&](float x, float y) {
+                return ctx.At(ImVec2(ch_center.x + x * c - y * sn, ch_center.y + x * sn + y * c));
+            };
+            const ImVec2 chevron_pts[3] = {rot(-2.5f, -5.0f), rot(2.5f, 0.0f), rot(-2.5f, 5.0f)};
+            ctx.dl->AddPolyline(chevron_pts, 3,
+                                ctx.Fade(IM_COL32(255, 255, 255,
+                                                  140 + static_cast<int>(100 * head.hover))),
+                                0, 2.0f);
+            if (head.clicked) noise_list_open_ = !noise_list_open_;
+
+            if (noise_list_open_) {
+                float y = pos.y + kRowH_TwoLine + 4.0f;
+                for (int i = 0; i < mode_count; ++i) {
+                    const ImVec2 item_pos(pos.x + 10.0f, y);
+                    const ImVec2 item_max(pos.x + col.w - 10.0f, y + kItemH);
+                    Interaction it = Hit(ctx, HashId("a-ns-item", static_cast<std::uint32_t>(i)),
+                                         item_pos, item_max);
+                    if (it.hover > 0.01f)
+                        ctx.dl->AddRectFilled(
+                            ctx.At(item_pos), ctx.At(item_max),
+                            ctx.Fade(IM_COL32(255, 255, 255, static_cast<int>(18 * it.hover))),
+                            10.0f);
+                    const bool selected = static_cast<std::size_t>(i) == mode;
+                    if (selected)
+                        ctx.dl->AddCircleFilled(
+                            ctx.At(ImVec2(item_pos.x + 14.0f, y + kItemH * 0.5f)), 3.5f,
+                            ctx.Fade(kAccent), 12);
+                    DrawText(ctx, Font::Small, ImVec2(item_pos.x + 28.0f, y + 9.0f),
+                             selected ? kText : kTextMuted, kNoiseSuppressionNames[i]);
+                    if (it.clicked) {
+                        s.noise_suppression = static_cast<NoiseSuppression>(i);
+                        noise_list_open_ = false;
+                        dirty = true;
+                    }
+                    y += kItemH;
+                }
+            }
+
+            if (maxine_missing) {
+                ActionWarning warning;
+                warning.text = "Прежде чем использовать NVIDIA Maxine";
+                warning.emphasis = "требуется его загрузить";
+                warning.button = model.maxine_downloading ? "Загрузка..." : "Загрузить";
+                warning.enabled = !model.maxine_downloading;
+                bool pressed = false;
+                const ImVec2 warn = col.Peek();
+                col.Skip(WarningActionRow(ctx, HashId("a-ns-get"), warn, col.w, kWarnAmber,
+                                          kWarnAmberBg, warning, pressed));
+                if (pressed && model.on_download_maxine) model.on_download_maxine();
+            }
+        }
+
         DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "аудиодорожки");
 
         const ImVec2 pos = col.Next(kRowH_Format);
@@ -1135,14 +1231,43 @@ void Menu::PageAudio(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
         }
 
         const bool single = s.audio_tracks == 0;
-        RowSubtitle(ctx, pos, single ? "Одна звуковая дорожка со звуками" : "Отдельные дорожки для",
-                    48.0f);
-        RowSubtitle(ctx, pos, single ? "системы и микрофона" : "системы и микрофона", 70.0f);
+        static constexpr const char* kLayoutLines[][2] = {
+            {"Звук системы и микрофона", "на одной дорожке"},
+            {"Общая, система", "и микрофон отдельно"},
+            {"Общая, микрофон и", "каждое приложение"},
+        };
+        const auto& lines = kLayoutLines[std::min<std::size_t>(s.audio_tracks, 2)];
+        RowSubtitle(ctx, pos, lines[0], 48.0f);
+        RowSubtitle(ctx, pos, lines[1], 70.0f);
 
         if (!single && !s.record_microphone) {
             const ImVec2 warn = col.Peek();
             col.Skip(WarningRow(ctx, warn, col.w, kWarnAmber, kWarnAmberBg,
-                                "Вторая дорожка появится только с включённым микрофоном!"));
+                                "Дорожка микрофона появится только с включённым микрофоном!"));
+        }
+
+        if (s.app_audio_tracks()) {
+            const ImVec2 pos = col.Next(kRowH_Format);
+            Interaction row = Row(ctx, HashId("a-apps-n"), pos, ImVec2(col.w, kRowH_Format));
+            RowIcon(ctx, row, pos, "data");
+            RowTitle(ctx, pos, "Количество дорожек");
+
+            const int span = static_cast<int>(kAppTrackSlotsMax - kAppTrackSlotsMin) + 1;
+            int index = static_cast<int>(s.app_track_slots - kAppTrackSlotsMin);
+            const std::string label = std::format("{}", s.app_track_slots);
+            if (Stepper(ctx, HashId("a-apps-n-s"), pos, col.w, pos.y + 25.0f, index, span,
+                        label.c_str())) {
+                s.app_track_slots = kAppTrackSlotsMin + static_cast<std::uint32_t>(index);
+                dirty = true;
+            }
+            RowSubtitle(ctx, pos, "Лишние приложения", 48.0f);
+            RowSubtitle(ctx, pos, "слышны в общей дорожке", 70.0f);
+
+            if (!s.record_system_audio) {
+                const ImVec2 warn = col.Peek();
+                col.Skip(WarningRow(ctx, warn, col.w, kWarnAmber, kWarnAmberBg,
+                                    "Дорожки приложений пишутся только вместе со звуком системы!"));
+            }
         }
     }
 
@@ -1527,12 +1652,17 @@ void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMo
         const ImVec2 a = ctx.At(ImVec2(center.x - half.x, center.y - half.y));
         const ImVec2 b = ctx.At(ImVec2(center.x + half.x, center.y + half.y));
 
-        ImTextureID tex = textures.Find(item.display_name);
-        if (!tex && item.thumb_ready && !item.thumbnail.empty()) {
+        const float screen_y = pos.y - scroll_.offset();
+        const bool on_screen = screen_y + tile_h >= view_min.y && screen_y <= view_max.y;
+
+        ImTextureID tex = on_screen ? textures.Find(item.display_name) : ImTextureID{};
+        if (on_screen && !tex && item.thumb_ready && !item.thumbnail.empty()) {
             tex = textures.FromRgba(item.display_name, item.thumbnail.data(),
                                     static_cast<int>(item.thumb_width),
                                     static_cast<int>(item.thumb_height));
             model.gallery->MarkUploaded(item.path);
+        } else if (on_screen && !tex && item.thumb_uploaded) {
+            model.gallery->ReloadThumbnail(item.path);
         }
 
         if (tex)
