@@ -182,4 +182,4 @@ third_party/       Dear ImGui, nanosvg, MinHook, заголовки NVENC
 
 Вложенные компоненты — Dear ImGui, MinHook, nanosvg и заголовки NVENC —
 распространяются на собственных условиях; их тексты собраны в
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
