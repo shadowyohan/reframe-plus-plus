@@ -10,7 +10,9 @@
 ; optional autostart and a clean uninstall.
 
 #define AppName        "reframe++"
-#define AppVersion     "2.0"
+#ifndef AppVersion
+  #define AppVersion "2.1"
+#endif
 #define AppPublisher   "shadowyohan"
 #define AppExe         "Reframe.exe"
 #define ElevatedTask   "reframe++"

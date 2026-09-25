@@ -164,6 +164,7 @@ void FontSet::Load(ImGuiIO& io, const std::filesystem::path& dir, float dpi_scal
     const assets::Blob embedded_regular = assets::Find("fonts/Actay-Regular.otf");
     const assets::Blob embedded_wide = assets::Find("fonts/ActayWide-BoldItalic.otf");
     const assets::Blob embedded_wide_bold = assets::Find("fonts/ActayWide-Bold.otf");
+    const assets::Blob embedded_italic = assets::Find("fonts/Actay-RegularItalic.otf");
 
     const auto regular = FindFontFile(dir, {L"Actay-Regular.otf", L"Actay-Regular.ttf",
                                             L"ActayRegular.ttf", L"segoeui.ttf"});
@@ -171,6 +172,8 @@ void FontSet::Load(ImGuiIO& io, const std::filesystem::path& dir, float dpi_scal
                                          L"ActayWideBoldItalic.ttf", L"seguibli.ttf"});
     const auto wide_bold = FindFontFile(dir, {L"ActayWide-Bold.otf", L"ActayWide-Bold.ttf",
                                               L"ActayWideBold.ttf", L"seguibl.ttf", L"segoeuib.ttf"});
+    const auto italic = FindFontFile(dir, {L"Actay-RegularItalic.otf", L"Actay-RegularItalic.ttf",
+                                           L"segoeuii.ttf"});
 
     design_fonts_ = !embedded_regular.empty() || regular.filename().wstring().starts_with(L"Actay");
     if (!design_fonts_)
@@ -229,6 +232,7 @@ void FontSet::Load(ImGuiIO& io, const std::filesystem::path& dir, float dpi_scal
     fonts_[static_cast<int>(Font::Toast)] = add(embedded_wide, wide, 16.0f);
     fonts_[static_cast<int>(Font::Warning)] = add(embedded_regular, regular, 17.0f);
     fonts_[static_cast<int>(Font::WarningBold)] = add(embedded_wide_bold, wide_bold, 17.0f);
+    fonts_[static_cast<int>(Font::Micro)] = add(embedded_italic, italic, 8.0f);
 
     io.Fonts->Build();
 }

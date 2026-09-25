@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cwctype>
 #include <filesystem>
 #include <format>
@@ -27,8 +26,6 @@ namespace rf {
 namespace {
 
 constexpr auto kWatchInterval = std::chrono::milliseconds(500);
-constexpr std::size_t kFifoCapSamples = 48'000 / 4 * 2;
-constexpr float kAudibleFloor = 1.0e-4f;
 
 struct ProcessEntry {
     std::uint32_t parent = 0;
@@ -110,12 +107,9 @@ Status AppAudioTracks::Start(std::uint32_t slots, std::uint32_t first_track,
                              std::uint32_t bitrate_bps, Ticks100ns epoch,
                              const std::function<void(PacketPtr)>& on_packet) {
     Stop();
-    epoch_ = epoch;
-    AudioFormat format;
     for (std::uint32_t i = 0; i < slots; ++i) {
         auto slot = std::make_unique<Slot>();
-        slot->encoder = std::make_unique<AacEncoder>();
-        RF_TRY(slot->encoder->Open(format, bitrate_bps, epoch, on_packet, first_track + i));
+        RF_TRY(slot->track.Open(first_track + i, bitrate_bps, epoch, on_packet));
         slots_.push_back(std::move(slot));
     }
 
@@ -129,10 +123,7 @@ void AppAudioTracks::Stop() {
     if (watching_.exchange(false)) wake_.notify_all();
     if (watcher_.joinable()) watcher_.join();
 
-    for (auto& slot : slots_) {
-        if (slot->capture) slot->capture->Stop();
-        if (slot->encoder) slot->encoder->Close();
-    }
+    for (auto& slot : slots_) slot->track.Close();
     slots_.clear();
     std::scoped_lock lock(slots_mutex_);
     overflowed_.clear();
@@ -140,18 +131,7 @@ void AppAudioTracks::Stop() {
 }
 
 void AppAudioTracks::Feed(std::uint32_t frames, Ticks100ns timestamp) {
-    const std::size_t samples = static_cast<std::size_t>(frames) * 2;
-    for (auto& slot : slots_) {
-        slot->scratch.assign(samples, 0.0f);
-        {
-            std::scoped_lock lock(slot->fifo_mutex);
-            const std::size_t take = std::min(slot->fifo.size(), samples);
-            std::copy_n(slot->fifo.begin(), take, slot->scratch.begin());
-            slot->fifo.erase(slot->fifo.begin(), slot->fifo.begin() + static_cast<std::ptrdiff_t>(take));
-        }
-        if (auto s = slot->encoder->Feed(slot->scratch.data(), frames, timestamp); !s.ok())
-            RF_WARN("application track encode: {}", s.str());
-    }
+    for (auto& slot : slots_) slot->track.Feed(frames, timestamp);
 }
 
 std::vector<std::string> AppAudioTracks::track_names() const {
@@ -163,7 +143,7 @@ std::vector<std::string> AppAudioTracks::track_names() const {
 
 std::vector<bool> AppAudioTracks::AudibleSince(Ticks100ns pts) const {
     std::vector<bool> audible;
-    for (const auto& slot : slots_) audible.push_back(slot->last_audible.load() >= pts);
+    for (const auto& slot : slots_) audible.push_back(slot->track.AudibleSince(pts));
     return audible;
 }
 
@@ -259,24 +239,8 @@ void AppAudioTracks::Assign(const AudioApp& app) {
     slot.root_pid = app.root_pid;
     slot.name = app.name;
 
-    slot.capture = std::make_unique<WasapiCapture>();
-    Slot* target = &slot;
-    const Ticks100ns epoch = epoch_;
-    const auto on_audio = [target, epoch](const AudioChunk& chunk) {
-        if (!chunk.samples || chunk.channels != 2) return;
-        const std::size_t count = static_cast<std::size_t>(chunk.frames) * 2;
-        const bool audible = std::any_of(chunk.samples, chunk.samples + count,
-                                         [](float v) { return std::abs(v) > kAudibleFloor; });
-        if (audible) target->last_audible.store(chunk.timestamp - epoch);
-        std::scoped_lock fifo_lock(target->fifo_mutex);
-        target->fifo.insert(target->fifo.end(), chunk.samples,
-                            chunk.samples + static_cast<std::size_t>(chunk.frames) * 2);
-        if (target->fifo.size() > kFifoCapSamples)
-            target->fifo.erase(target->fifo.begin(), target->fifo.end() - kFifoCapSamples);
-    };
-    if (auto s = slot.capture->StartApplication(app.root_pid, on_audio); !s.ok()) {
+    if (auto s = slot.track.Capture(app.root_pid); !s.ok()) {
         RF_WARN("cannot capture {} on its own track: {}", app.name, s.str());
-        slot.capture.reset();
         return;
     }
     RF_INFO("audio of {} (PID {}) goes to application track {}", app.name, app.root_pid,

@@ -12,6 +12,7 @@ namespace {
 using namespace theme;
 
 constexpr float kToastLifetime = 3.5f;
+constexpr float kUpdateToastLifetime = 10.0f;
 
 constexpr float kIconDelaySaved = 0.18f;
 constexpr float kIconDelay = 0.13f;
@@ -104,6 +105,9 @@ const char* IconFor(Hud::Kind kind) {
         case Hud::Kind::Error:            return "setting-3";
         case Hud::Kind::TrackLimit:       return "warning-hex";
         case Hud::Kind::Download:         return "nvidia";
+        case Hud::Kind::AppSupport:       return "code";
+        case Hud::Kind::Processing:       return "repeat-circle";
+        case Hud::Kind::Update:           return "refresh-circle";
     }
     return "repeat-circle";
 }
@@ -129,6 +133,7 @@ void Hud::Push(Kind kind, std::string text, std::string thumb_key, std::string a
     toast.text = std::move(text);
     toast.app = std::move(app);
     toast.thumb_key = std::move(thumb_key);
+    toast.lifetime = kToastLifetime;
     toast.slide.Reset(600.0f);
     toast.slide.SetTarget(0.0f);
     toast.icon.Reset(0.0f);
@@ -145,6 +150,43 @@ void Hud::Push(Kind kind, std::string text, std::string thumb_key, std::string a
 void Hud::PushTrackLimit(std::string app) {
     Push(Kind::TrackLimit, TrFormat("Звук из {} не записывается на свою дорожку.", app), {}, app);
     toasts_.back().subtitle = "Достигнут лимит дорожек.";
+}
+
+void Hud::PushProcessing(std::uint64_t id, std::string text, std::string app) {
+    Push(Kind::Processing, std::move(text), {}, std::move(app));
+    toasts_.back().id = id;
+    toasts_.back().sticky = true;
+    toasts_.back().progress = 0.0f;
+}
+
+void Hud::PushUpdate(std::string text, std::string version) {
+    Push(Kind::Update, std::move(text), {}, std::move(version));
+    toasts_.back().lifetime = kUpdateToastLifetime;
+}
+
+void Hud::SetProcessingProgress(std::uint64_t id, float progress) {
+    for (Toast& toast : toasts_)
+        if (toast.id == id && toast.kind == Kind::Processing)
+            toast.progress = std::clamp(progress, toast.progress, 1.0f);
+}
+
+void Hud::FinishProcessing(std::uint64_t id, Kind kind, std::string text, std::string thumb_key,
+                           std::string app) {
+    const auto it = std::find_if(toasts_.begin(), toasts_.end(),
+                                 [id](const Toast& t) { return t.id == id && !t.leaving; });
+    if (it == toasts_.end()) {
+        Push(kind, std::move(text), std::move(thumb_key), std::move(app));
+        return;
+    }
+    it->kind = kind;
+    it->text = std::move(text);
+    it->thumb_key = std::move(thumb_key);
+    it->app = std::move(app);
+    it->progress = -1.0f;
+    it->sticky = false;
+    it->age = 0.0f;
+    it->lifetime = kToastLifetime;
+    it->icon.Reset(0.0f);
 }
 
 void Hud::SetDownload(std::string text, std::string product, float progress) {
@@ -165,7 +207,7 @@ void Hud::EndDownload() {
     for (Toast& toast : toasts_) {
         if (toast.kind != Kind::Download || !toast.sticky) continue;
         toast.sticky = false;
-        toast.age = std::max(toast.age, kToastLifetime - 1.5f);
+        toast.age = std::max(toast.age, toast.lifetime - 1.5f);
     }
 }
 
@@ -224,6 +266,42 @@ void Hud::DrawToastIcon(UiContext& ctx, const Toast& toast, ImVec2 card_pos,
             const float scale = 3.0f - 2.0f * std::clamp(t, 0.0f, 1.0f);
             DrawIcon(ctx, IconFor(toast.kind), ImVec2(card_pos.x + 25.0f, card_pos.y + 18.5f),
                      50.0f, kDanger, scale);
+            break;
+        }
+
+        case Kind::Processing: {
+            ctx.alpha = saved_alpha * std::clamp((toast.age - kIconDelay) / 0.25f, 0.0f, 1.0f);
+            constexpr float kRing = 50.0f, kRadius = 22.0f, kThickness = 6.0f;
+            constexpr ImU32 kRingTrack = IM_COL32(255, 255, 255, 51);
+            constexpr ImVec2 kLabel(25.0f, 11.0f);
+            const ImVec2 origin(card_pos.x + 20.0f, card_pos.y + (kToastH - kRing) * 0.5f);
+            const ImVec2 center(origin.x + kRing * 0.5f, origin.y + kRing * 0.5f);
+            ctx.dl->AddCircle(ctx.At(center), kRadius, ctx.Fade(kRingTrack), 64, kThickness);
+
+            const float progress = std::clamp(toast.progress, 0.0f, 1.0f);
+            if (progress > 0.0f) {
+                const float start = -90.0f * kDegToRad;
+                const float end = start + progress * 360.0f * kDegToRad;
+                ctx.dl->PathArcTo(ctx.At(center), kRadius, start, end, 64);
+                ctx.dl->PathStroke(ctx.Fade(kAppAccent), 0, kThickness);
+                for (const float angle : {start, end})
+                    ctx.dl->AddCircleFilled(
+                        ctx.At(ImVec2(center.x + std::cos(angle) * kRadius,
+                                      center.y + std::sin(angle) * kRadius)),
+                        kThickness * 0.5f, ctx.Fade(kAppAccent), 16);
+            }
+
+            const ImVec2 label_min(origin.x + 12.5f, origin.y + 20.0f);
+            ctx.dl->AddRectFilled(ctx.At(label_min),
+                                  ctx.At(ImVec2(label_min.x + kLabel.x, label_min.y + kLabel.y)),
+                                  ctx.Fade(kRingTrack), 3.0f);
+            const std::string percent =
+                std::format("{}%", static_cast<int>(progress * 100.0f + 0.5f));
+            const ImVec2 size = MeasureText(ctx, Font::Micro, percent.c_str());
+            DrawText(ctx, Font::Micro,
+                     ImVec2(label_min.x + (kLabel.x - size.x) * 0.5f,
+                            label_min.y + (kLabel.y - size.y) * 0.5f),
+                     kText, percent.c_str());
             break;
         }
 
@@ -398,7 +476,7 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
     float y = kToastMargin;
     for (auto& toast : toasts_) {
         toast.age += ctx.dt;
-        if (toast.age > kToastLifetime && !toast.leaving && !toast.sticky) {
+        if (toast.age > toast.lifetime && !toast.leaving && !toast.sticky) {
             toast.leaving = true;
             toast.slide.SetTarget(700.0f);
         }

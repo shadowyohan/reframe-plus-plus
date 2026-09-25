@@ -100,16 +100,24 @@ add_library(reframe_core STATIC
 
     rf/audio/AacEncoder.cpp
     rf/audio/AppAudioTracks.cpp
+    rf/audio/ProcessAudioTrack.cpp
     rf/audio/MaxineSetup.cpp
     rf/audio/NoiseSuppressor.cpp
     rf/audio/WasapiCapture.cpp
+    rf/mux/ClipCropper.cpp
     rf/mux/Mp4Muxer.cpp
     rf/mux/TrackNames.cpp
     rf/player/VideoPlayer.cpp
     rf/replay/ReplayBuffer.cpp
 
+    rf/integrations/ClipScheduler.cpp
+    rf/integrations/ControlServer.cpp
+    rf/integrations/Protocol.cpp
+    rf/integrations/SdkHost.cpp
+
     rf/engine/Recorder.cpp
     rf/engine/Settings.cpp
+    rf/engine/UpdateCheck.cpp
 
     rf/gallery/Gallery.cpp
 
@@ -132,7 +140,7 @@ target_link_libraries(reframe_core PUBLIC
     rf::rnnoise rf::speexdsp
     d3d11 dxgi dxguid dcomp
     mfplat mfuuid mf mfreadwrite
-    avrt ole32 oleaut32 shlwapi propsys dwmapi)
+    avrt ole32 oleaut32 shlwapi propsys dwmapi winhttp)
 
 if(RF_ENABLE_WGC)
     target_compile_definitions(reframe_core PUBLIC RF_HAS_WGC)

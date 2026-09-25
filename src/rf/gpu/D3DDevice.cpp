@@ -93,7 +93,7 @@ const char* D3DDevice::DescribeRemovedReason(HRESULT reason) {
 
 namespace {
 
-enum class GpuSchedulingClass : INT { kHigh = 4, kRealtime = 5 };
+enum class GpuSchedulingClass : INT { kBelowNormal = 1, kHigh = 4, kRealtime = 5 };
 
 constexpr INT kMaxGpuThreadPriority = 7;
 
@@ -141,6 +141,11 @@ void RaiseProcessGpuSchedulingClass() {
     }
 }
 
+}
+
+void LowerProcessGpuPriority() {
+    if (!SetProcessGpuSchedulingClass(GpuSchedulingClass::kBelowNormal))
+        RF_WARN("could not lower the GPU scheduling class");
 }
 
 void D3DDevice::RaiseGpuPriority() {

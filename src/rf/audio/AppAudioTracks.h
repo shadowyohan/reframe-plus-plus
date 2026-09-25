@@ -3,7 +3,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -11,8 +10,7 @@
 #include <thread>
 #include <vector>
 
-#include "rf/audio/AacEncoder.h"
-#include "rf/audio/WasapiCapture.h"
+#include "rf/audio/ProcessAudioTrack.h"
 
 namespace rf {
 
@@ -45,24 +43,16 @@ public:
                                                 std::uint32_t root_pid, std::uint32_t slots);
 
 private:
-    static constexpr Ticks100ns kNeverAudible = std::numeric_limits<Ticks100ns>::min();
-
     struct Slot {
-        std::unique_ptr<AacEncoder> encoder;
-        std::unique_ptr<WasapiCapture> capture;
+        ProcessAudioTrack track;
         std::uint32_t root_pid = 0;
         std::string name;
-        std::mutex fifo_mutex;
-        std::vector<float> fifo;
-        std::vector<float> scratch;
-        std::atomic<Ticks100ns> last_audible{kNeverAudible};
     };
 
     void WatchLoop();
     void Assign(const AudioApp& app);
 
     std::vector<std::unique_ptr<Slot>> slots_;
-    Ticks100ns epoch_ = 0;
     mutable std::mutex slots_mutex_;
     std::set<std::uint32_t> overflowed_;
     std::vector<std::string> overflow_queue_;

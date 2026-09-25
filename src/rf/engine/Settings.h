@@ -59,6 +59,10 @@ struct Settings {
     bool replay_enabled = true;
     std::uint32_t replay_seconds = 300;
 
+    bool app_clips_allowed = true;
+    bool app_clips_crop_to_window = true;
+    bool app_clips_app_audio_only = true;
+
     std::uint32_t replay_max_memory_mb = 8192;
 
     std::uint32_t quality = 2;

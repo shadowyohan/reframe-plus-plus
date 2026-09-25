@@ -19,6 +19,9 @@ public:
         Error,
         TrackLimit,
         Download,
+        AppSupport,
+        Processing,
+        Update,
     };
 
     struct Badges {
@@ -32,6 +35,11 @@ public:
 
     void Push(Kind kind, std::string text, std::string thumb_key = {}, std::string app = {});
     void PushTrackLimit(std::string app);
+    void PushProcessing(std::uint64_t id, std::string text, std::string app);
+    void PushUpdate(std::string text, std::string version);
+    void SetProcessingProgress(std::uint64_t id, float progress);
+    void FinishProcessing(std::uint64_t id, Kind kind, std::string text, std::string thumb_key,
+                          std::string app);
     void SetDownload(std::string text, std::string product, float progress);
     void EndDownload();
     void SetRecording(bool recording, double seconds, std::string app = {});
@@ -58,6 +66,8 @@ private:
         std::string thumb_key;
         std::string subtitle;
         float progress = -1.0f;
+        std::uint64_t id = 0;
+        float lifetime = 0.0f;
         bool sticky = false;
         float age = 0.0f;
         bool leaving = false;

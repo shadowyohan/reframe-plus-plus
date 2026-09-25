@@ -36,6 +36,45 @@ struct Column {
 constexpr float kH1Height = 36.0f;
 constexpr float kH2Height = 29.0f;
 
+struct WrappedRow {
+    ImVec2 pos;
+    float height = 0.0f;
+    Interaction row;
+};
+
+WrappedRow DrawWrappedRow(UiContext& ctx, Column& col, std::uint32_t id, const char* icon,
+                          const char* title, const char* subtitle, float control_w,
+                          bool clickable) {
+    constexpr float kLineGap = 5.0f;
+    const float room = col.w - kRowTextX - control_w;
+    const float title_h = MeasureTextWrapped(ctx, Font::Body, room, title).y;
+    const float sub_h = subtitle ? MeasureTextWrapped(ctx, Font::Small, room, subtitle).y : 0.0f;
+    const float content = title_h + (subtitle ? kLineGap + sub_h : 0.0f);
+
+    WrappedRow out;
+    out.height = std::max(kRowH_TwoLine, content + 2 * kRowTitleY);
+    out.pos = col.Next(out.height);
+    out.row = Row(ctx, id, out.pos, ImVec2(col.w, out.height), clickable);
+    RowIcon(ctx, out.row, out.pos, icon);
+
+    const float text_x = out.pos.x + kRowTextX;
+    const float top = out.pos.y + kRowTitleY;
+    DrawTextWrapped(ctx, Font::Body, ImVec2(text_x, top), room, kText, title);
+    if (subtitle)
+        DrawTextWrapped(ctx, Font::Small, ImVec2(text_x, top + title_h + kLineGap), room,
+                        kTextMuted, subtitle);
+    return out;
+}
+
+bool WrappedToggleRow(UiContext& ctx, Column& col, const char* id, const char* icon,
+                      const char* title, const char* subtitle, bool& value) {
+    constexpr float kToggleColumn = 95.0f + 10.0f;
+    const WrappedRow row =
+        DrawWrappedRow(ctx, col, HashId(id), icon, title, subtitle, kToggleColumn, false);
+    const ImVec2 toggle(row.pos.x + col.w - 95.0f, row.pos.y + (row.height - kToggleH) * 0.5f);
+    return Toggle(ctx, HashId(id, 1), toggle, value);
+}
+
 std::string FormatHms(double seconds) {
     const int total = static_cast<int>(seconds + 0.5);
     return std::format("{:02}:{:02}", total / 60, total % 60);
@@ -463,6 +502,7 @@ void Menu::DrawPage(UiContext& ctx, Page page, ImVec2 panel_min, ImVec2 panel_ma
         case Page::Disk:     PageDisk(ctx, panel_min, panel_max, model); break;
         case Page::Interface: PageInterface(ctx, panel_min, panel_max, model); break;
         case Page::Keybinds: PageKeybinds(ctx, panel_min, panel_max, model); break;
+        case Page::AutoClips: PageAutoClips(ctx, panel_min, panel_max, model); break;
         case Page::Gallery:  PageGallery(ctx, panel_min, panel_max, model, textures); break;
     }
 
@@ -619,23 +659,43 @@ void Menu::PageSettings(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec
         {"monitor-recorder", "Видео", "Настройки записи видео", Page::Video, "nav-video"},
         {"sound", "Аудио", "Настройки записи аудио", Page::Audio, "nav-audio"},
         {"driver-2", "Диск", "Настройки хранилища", Page::Disk, "nav-disk"},
-        {"setting-3", "Интерфейс", "Настройки интерфейса", Page::Interface, "nav-ui"},
-        {"driver-2", "Горячие клавиши", "Настройки кейбиндов", Page::Keybinds, "nav-keys"},
+        {"keyboard", "Горячие клавиши", "Настройки кейбиндов", Page::Keybinds, "nav-keys"},
+        {"gallery", "Интерфейс", "Настройки интерфейса", Page::Interface, "nav-ui"},
+        {"repeat-circle", "Авто-откаты", "Настройка авто-откатов от поддерживаемых приложений",
+         Page::AutoClips, "nav-auto"},
     };
 
     for (const Entry& entry : kEntries) {
-        const ImVec2 pos = col.Next(kRowH_TwoLine);
-        Interaction row = Row(ctx, HashId(entry.id), pos, ImVec2(col.w, kRowH_TwoLine), true);
-        RowIcon(ctx, row, pos, entry.icon);
-        RowTitle(ctx, pos, entry.title);
-        RowSubtitle(ctx, pos, entry.subtitle, 41.0f);
-
-        const bool btn = CircleButton(ctx, HashId(entry.id, 1),
-                                      ImVec2(pos.x + col.w - 62.0f, pos.y + 10.0f), kCircleBtnSize,
-                                      "arrow-circle");
-        if (row.clicked || btn) Navigate(entry.page, true);
+        constexpr float kButtonColumn = 62.0f + 10.0f;
+        const WrappedRow row = DrawWrappedRow(ctx, col, HashId(entry.id), entry.icon, entry.title,
+                                              entry.subtitle, kButtonColumn, true);
+        const ImVec2 button(row.pos.x + col.w - 62.0f,
+                            row.pos.y + (row.height - kCircleBtnSize) * 0.5f);
+        const bool btn =
+            CircleButton(ctx, HashId(entry.id, 1), button, kCircleBtnSize, "arrow-circle");
+        if (row.row.clicked || btn) Navigate(entry.page, true);
     }
 
+}
+
+void Menu::PageAutoClips(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,
+                         AppModel& model) {
+    Settings& s = *model.settings;
+    Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
+    col.bottom = &content_bottom_;
+    DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "авто-откаты");
+
+    bool dirty = WrappedToggleRow(ctx, col, "ac-allow", "tick-circle",
+                                  "Разрешить использовать авто-откаты", nullptr,
+                                  s.app_clips_allowed);
+    dirty |= WrappedToggleRow(ctx, col, "ac-crop", "video-time", "Обрезка кадра",
+                              "Обрезать кадр до размеров окна приложения",
+                              s.app_clips_crop_to_window);
+    dirty |= WrappedToggleRow(ctx, col, "ac-audio", "sound", "Звук только из приложения",
+                              "Оставить в повторе только звук из приложения",
+                              s.app_clips_app_audio_only);
+
+    if (dirty && model.on_settings_changed) model.on_settings_changed();
 }
 
 void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 panel_max,

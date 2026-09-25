@@ -41,6 +41,15 @@ SIZE PrimaryDisplayPixels() {
     return {0, 0};
 }
 
+std::string FileNameSafe(std::string name) {
+    constexpr std::string_view kReserved = "<>:\"/\\|?*";
+    for (char& c : name)
+        if (static_cast<unsigned char>(c) < 0x20 || kReserved.find(c) != std::string_view::npos)
+            c = '_';
+    while (!name.empty() && (name.back() == '.' || name.back() == ' ')) name.pop_back();
+    return name.empty() ? std::string("App") : name;
+}
+
 bool ExclusiveFullscreenInFront() {
     QUERY_USER_NOTIFICATION_STATE state{};
     return SUCCEEDED(::SHQueryUserNotificationState(&state)) &&
@@ -255,6 +264,7 @@ Status Recorder::BuildPipeline() {
     video_format_.fps_den = 1;
     video_format_.codec = settings_.codec;
     video_format_.color = settings_.hdr ? ColorSpace::Rec2020Pq : ColorSpace::Rec709;
+    RememberGeometry(target, hooked);
 
     EncoderConfig cfg;
     cfg.format = video_format_;
@@ -383,14 +393,9 @@ Status Recorder::BuildPipeline() {
             }
         }
 
-        system_audio_ = std::make_unique<WasapiCapture>();
-        if (auto s = system_audio_->Start(AudioSource::SystemLoopback,
-                                          [this](const AudioChunk& c) { OnSystemAudio(c); });
-            !s.ok()) {
-            RF_WARN("system audio unavailable: {}", s.str());
-            system_audio_.reset();
-        }
+        StartSystemAudioLocked();
     }
+    if (game_audio_pid_) StartGameAudioLocked();
 
     denoiser_.Close();
     if (settings_.record_microphone && settings_.mic_noise_suppression) {
@@ -475,6 +480,12 @@ void Recorder::DisarmReplayLocked() {
     StopWriter();
     if (system_audio_) system_audio_->Stop();
     if (microphone_) microphone_->Stop();
+    StopGameAudioLocked();
+    {
+        std::scoped_lock lock(window_mutex_);
+        geometry_.valid = false;
+        window_samples_.clear();
+    }
     app_tracks_.Stop();
     if (aac_) aac_->Close();
     if (aac_mic_) aac_mic_->Close();
@@ -494,8 +505,185 @@ void Recorder::DisarmReplayLocked() {
     state_ = State::Idle;
 }
 
+void Recorder::StartSystemAudioLocked() {
+    if (system_audio_) return;
+    system_audio_ = std::make_unique<WasapiCapture>();
+    if (auto s = system_audio_->Start(AudioSource::SystemLoopback,
+                                      [this](const AudioChunk& c) { OnSystemAudio(c); });
+        !s.ok()) {
+        RF_WARN("system audio unavailable: {}", s.str());
+        system_audio_.reset();
+    }
+}
+
+void Recorder::SetGameAudio(std::uint32_t pid) {
+    std::scoped_lock lock(pipeline_mutex_);
+    if (pid == game_audio_pid_) return;
+    game_audio_pid_ = pid;
+    StopGameAudioLocked();
+    if (pid && capture_) StartGameAudioLocked();
+}
+
+void Recorder::StartGameAudioLocked() {
+    const std::uint32_t track = AudioTrackCount();
+    if (track >= kMaxAudioTracks) {
+        RF_WARN("no audio track left for the SDK application (PID {})", game_audio_pid_);
+        return;
+    }
+
+    auto audio = std::make_unique<ProcessAudioTrack>();
+    if (auto s = audio->Open(track, settings_.audio_bitrate_kbps * 1000, epoch_,
+                             [this](PacketPtr p) { OnPacket(std::move(p)); });
+        !s.ok()) {
+        RF_WARN("SDK application track unavailable: {}", s.str());
+        return;
+    }
+    if (auto s = audio->Capture(game_audio_pid_); !s.ok()) {
+        RF_WARN("cannot capture the audio of PID {}: {}", game_audio_pid_, s.str());
+        return;
+    }
+    StartSystemAudioLocked();
+
+    std::scoped_lock lock(game_audio_mutex_);
+    game_audio_ = std::move(audio);
+    RF_INFO("audio of PID {} goes to the SDK track {}", game_audio_pid_, track + 1);
+}
+
+void Recorder::StopGameAudioLocked() {
+    std::unique_ptr<ProcessAudioTrack> stopped;
+    std::scoped_lock lock(game_audio_mutex_);
+    stopped.swap(game_audio_);
+}
+
+void Recorder::RememberGeometry(const CaptureTarget& target, bool hooked) {
+    CaptureGeometry geometry;
+    geometry.valid = true;
+    geometry.display = target.kind != CaptureTarget::Kind::Window;
+    geometry.hooked = hooked;
+    geometry.window = static_cast<HWND>(target.hwnd);
+    MONITORINFO monitor{sizeof(monitor)};
+    if (target.hmonitor && ::GetMonitorInfoW(static_cast<HMONITOR>(target.hmonitor), &monitor))
+        geometry.monitor = monitor.rcMonitor;
+    geometry.source_width = capture_->width();
+    geometry.source_height = capture_->height();
+    geometry.video_width = video_format_.width;
+    geometry.video_height = video_format_.height;
+
+    std::scoped_lock lock(window_mutex_);
+    geometry_ = geometry;
+    window_samples_.clear();
+}
+
+HWND Recorder::GameWindowOf(std::uint32_t pid) {
+    const Ticks100ns now = Now100ns();
+    if (pid == game_window_pid_ && game_window_ && ::IsWindow(game_window_) &&
+        now - game_window_checked_ < 2 * kOneSecond100ns)
+        return game_window_;
+
+    struct Search {
+        DWORD pid = 0;
+        HWND best = nullptr;
+        LONGLONG best_area = 0;
+    } search{pid};
+    ::EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+            auto& s = *reinterpret_cast<Search*>(param);
+            DWORD owner = 0;
+            ::GetWindowThreadProcessId(hwnd, &owner);
+            if (owner != s.pid || !::IsWindowVisible(hwnd) || ::GetWindow(hwnd, GW_OWNER))
+                return TRUE;
+            RECT rect{};
+            ::GetWindowRect(hwnd, &rect);
+            const LONGLONG area =
+                static_cast<LONGLONG>(rect.right - rect.left) * (rect.bottom - rect.top);
+            if (area > s.best_area) {
+                s.best = hwnd;
+                s.best_area = area;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+
+    game_window_ = search.best;
+    game_window_pid_ = pid;
+    game_window_checked_ = now;
+    return game_window_;
+}
+
+void Recorder::SampleGameWindow(std::uint32_t pid) {
+    CaptureGeometry geometry;
+    {
+        std::scoped_lock lock(window_mutex_);
+        geometry = geometry_;
+    }
+    if (!geometry.valid || !pid || !geometry.source_width || !geometry.source_height) return;
+
+    WindowSample sample;
+    sample.at = Now100ns();
+    if (HWND game = GameWindowOf(pid)) {
+        RECT client{};
+        ::GetClientRect(game, &client);
+        ::MapWindowPoints(game, nullptr, reinterpret_cast<POINT*>(&client), 2);
+
+        POINT origin{geometry.monitor.left, geometry.monitor.top};
+        bool in_frame = geometry.display;
+        if (!geometry.display && geometry.window == game) {
+            in_frame = true;
+            RECT bounds{};
+            if (geometry.hooked) {
+                origin = {client.left, client.top};
+            } else if (SUCCEEDED(::DwmGetWindowAttribute(game, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds,
+                                                         sizeof(bounds)))) {
+                origin = {bounds.left, bounds.top};
+            }
+        }
+
+        const double sx = static_cast<double>(geometry.video_width) / geometry.source_width;
+        const double sy = static_cast<double>(geometry.video_height) / geometry.source_height;
+        sample.crop = {static_cast<std::int32_t>((client.left - origin.x) * sx),
+                       static_cast<std::int32_t>((client.top - origin.y) * sy),
+                       static_cast<std::int32_t>((client.right - origin.x) * sx),
+                       static_cast<std::int32_t>((client.bottom - origin.y) * sy)};
+
+        DWORD foreground = 0;
+        ::GetWindowThreadProcessId(::GetForegroundWindow(), &foreground);
+        const bool overlaps = sample.crop.right > 0 && sample.crop.bottom > 0 &&
+                              sample.crop.left < static_cast<std::int32_t>(geometry.video_width) &&
+                              sample.crop.top < static_cast<std::int32_t>(geometry.video_height);
+        sample.visible = in_frame && overlaps && foreground == pid && !::IsIconic(game);
+    }
+
+    constexpr Ticks100ns kKeep = 12 * 60 * kOneSecond100ns;
+    std::scoped_lock lock(window_mutex_);
+    window_samples_.push_back(sample);
+    while (sample.at - window_samples_.front().at > kKeep) window_samples_.pop_front();
+}
+
+std::vector<WindowSample> Recorder::WindowSamplesBetween(Ticks100ns from, Ticks100ns to) const {
+    std::scoped_lock lock(window_mutex_);
+    std::vector<WindowSample> samples;
+    for (const WindowSample& sample : window_samples_) {
+        if (sample.at > to) break;
+        WindowSample relative = sample;
+        relative.at = std::max<Ticks100ns>(sample.at - from, 0);
+        if (sample.at < from && !samples.empty())
+            samples.back() = relative;
+        else
+            samples.push_back(relative);
+    }
+    if (samples.empty() || samples.front().at > 0) samples.insert(samples.begin(), WindowSample{});
+    return samples;
+}
+
+void Recorder::FeedGameAudio(std::uint32_t frames, Ticks100ns timestamp) {
+    std::scoped_lock lock(game_audio_mutex_);
+    if (game_audio_) game_audio_->Feed(frames, timestamp);
+}
+
 void Recorder::OnSystemAudio(const AudioChunk& chunk) {
-    if (!aac_ || !chunk.samples || chunk.frames == 0) return;
+    if (!chunk.samples || chunk.frames == 0) return;
+    FeedGameAudio(chunk.frames, chunk.timestamp);
+    if (!aac_) return;
 
     const std::size_t samples = static_cast<std::size_t>(chunk.frames) * chunk.channels;
     mix_scratch_.assign(chunk.samples, chunk.samples + samples);
@@ -941,15 +1129,39 @@ void Recorder::WriterLoop() {
     }
 }
 
-std::filesystem::path Recorder::MakeOutputPath(const char* suffix) const {
+std::filesystem::path Recorder::MakeOutputPath(std::string_view label,
+                                               std::string_view tail) const {
     SYSTEMTIME now{};
     ::GetLocalTime(&now);
     const auto stamp = std::format("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}", now.wYear, now.wMonth,
                                    now.wDay, now.wHour, now.wMinute, now.wSecond);
-    return settings_.output_dir / ToWide(std::format("Reframe_{}_{}.mp4", suffix, stamp));
+    const std::string name = tail.empty()
+                                 ? std::format("Reframe_{}_{}.mp4", label, stamp)
+                                 : std::format("Reframe_{}_{}_{}.mp4", label, stamp, tail);
+    return settings_.output_dir / ToWide(name);
 }
 
-Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t seconds) {
+Status Recorder::WriteClipLocked(const std::filesystem::path& path, Ticks100ns window,
+                                 IMFMediaType* audio_type, std::uint32_t audio_tracks,
+                                 const std::vector<std::uint32_t>& kept_tracks,
+                                 Ticks100ns* covered_to) {
+    Mp4Muxer muxer;
+    RF_TRY(muxer.Open(path, video_format_, encoder_ ? encoder_->codec_private() : CodecPrivate{},
+                      audio_type, audio_tracks, kept_tracks));
+
+    const auto write = [&muxer](PacketPtr packet) { return muxer.WritePacket(*packet); };
+    if (auto s = replay_.Snapshot(window, write, covered_to); !s.ok()) {
+        (void)muxer.Close();
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return s;
+    }
+    if (encoder_) encoder_->RequestKeyframe();
+    return muxer.Close();
+}
+
+Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t seconds,
+                            bool release_saved) {
 
     std::scoped_lock pipeline_lock(pipeline_mutex_);
     if (!settings_.replay_enabled) return Status::Fail("instant replay is disabled");
@@ -961,22 +1173,11 @@ Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t secon
     if (replay_.GetStats().video_packets == 0) return Status::Fail("replay buffer is empty");
 
     const auto path = MakeOutputPath("Replay");
-
-    Mp4Muxer muxer;
     const std::vector<std::uint32_t> kept = AudibleAudioTracks(replay_.ClipStart(window));
-    RF_TRY(muxer.Open(path, video_format_, encoder_ ? encoder_->codec_private() : CodecPrivate{},
-                      aac_ ? aac_->output_type() : nullptr, AudioTrackCount(), kept));
 
     Ticks100ns covered_to = 0;
-    const auto write = [&muxer](PacketPtr packet) { return muxer.WritePacket(*packet); };
-    if (auto s = replay_.Snapshot(window, write, &covered_to); !s.ok()) {
-        (void)muxer.Close();
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        return s;
-    }
-    if (encoder_) encoder_->RequestKeyframe();
-    RF_TRY(muxer.Close());
+    RF_TRY(WriteClipLocked(path, window, aac_ ? aac_->output_type() : nullptr, AudioTrackCount(),
+                           kept, &covered_to));
     if (aac_) {
         if (auto s = WriteAudioTrackNames(path, AudioTrackNames(kept), MicInMainTrack()); !s.ok())
             RF_WARN("could not name the audio tracks of {}: {}", path.string(), s.str());
@@ -984,9 +1185,77 @@ Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t secon
 
     if (saved_to) *saved_to = path;
 
+    if (!release_saved) {
+        RF_INFO("replay saved: {} - kept in the buffer for SDK clips", path.string());
+        return Status::Ok();
+    }
     replay_.DropThrough(covered_to);
 
     RF_INFO("replay saved: {} - the next one starts where this one ends", path.string());
+    return Status::Ok();
+}
+
+Status Recorder::SaveGameClip(const std::string& app, const std::string& tag,
+                              std::uint32_t seconds, GameClip& out) {
+    std::scoped_lock pipeline_lock(pipeline_mutex_);
+    if (!settings_.replay_enabled) return Status::Fail("instant replay is disabled");
+    if (replay_.GetStats().video_packets == 0) return Status::Fail("replay buffer is empty");
+
+    const Ticks100ns window = static_cast<Ticks100ns>(seconds) * kOneSecond100ns;
+    const Ticks100ns start = replay_.ClipStart(window);
+    const auto path = MakeOutputPath(FileNameSafe(app), tag);
+
+    out.crop = {};
+    out.crop.output = path;
+    out.crop.samples = WindowSamplesBetween(start + epoch_, Now100ns());
+    out.crop.frame_width = video_format_.width;
+    out.crop.frame_height = video_format_.height;
+    out.crop.bitrate_kbps = settings_.bitrate_kbps;
+    out.needs_crop =
+        settings_.app_clips_crop_to_window &&
+        NeedsCropping(out.crop.samples, out.crop.frame_width, out.crop.frame_height);
+    out.crop.raw = path;
+    if (out.needs_crop) {
+        const std::filesystem::path scratch =
+            settings_.temp_dir.empty() ? path.parent_path() : settings_.temp_dir;
+        std::error_code ec;
+        std::filesystem::create_directories(scratch, ec);
+        out.crop.raw = scratch / (path.filename().wstring() + L".part");
+    }
+
+    IMFMediaType* audio_type = nullptr;
+    std::uint32_t audio_tracks = 0;
+    std::vector<std::uint32_t> kept;
+    if (settings_.app_clips_app_audio_only) {
+        std::scoped_lock lock(game_audio_mutex_);
+        if (game_audio_ && game_audio_->capturing()) {
+            audio_type = game_audio_->output_type();
+            audio_tracks = game_audio_->track() + 1;
+            kept.push_back(game_audio_->track());
+            out.crop.audio_names = {app};
+        }
+    } else if (aac_) {
+        audio_type = aac_->output_type();
+        audio_tracks = AudioTrackCount();
+        kept = AudibleAudioTracks(start);
+        out.crop.audio_names = AudioTrackNames(kept);
+        out.crop.first_track_is_full_mix = MicInMainTrack();
+    }
+
+    Ticks100ns covered_to = 0;
+    RF_TRY(WriteClipLocked(out.crop.raw, window, audio_type, audio_tracks, kept, &covered_to));
+    if (audio_type && !out.needs_crop) {
+        if (auto s = WriteAudioTrackNames(path, out.crop.audio_names,
+                                          out.crop.first_track_is_full_mix);
+            !s.ok())
+            RF_WARN("could not name the audio tracks of {}: {}", path.string(), s.str());
+    }
+
+    out.path = path;
+    out.seconds =
+        static_cast<std::uint32_t>((covered_to - start + kOneSecond100ns / 2) / kOneSecond100ns);
+    RF_INFO("SDK clip from {} saved: {} ({} s{})", app, out.crop.raw.string(), out.seconds,
+            out.needs_crop ? ", cropping to the game window next" : "");
     return Status::Ok();
 }
 

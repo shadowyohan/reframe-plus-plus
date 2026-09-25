@@ -11,6 +11,9 @@ add_executable(reframe-tests
     test_app_audio_tracks.cpp
     test_track_names.cpp
     test_cursor_painter.cpp
+    test_integrations.cpp
+    test_clip_cropper.cpp
+    test_update_check.cpp
     ${CMAKE_SOURCE_DIR}/third_party/rnnoise/rnnoise_model.rc
 )
 rf_target_defaults(reframe-tests)

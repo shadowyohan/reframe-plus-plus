@@ -123,6 +123,9 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.show_stop_button = GetBool(m, "show_stop_button", s.show_stop_button);
     s.show_mic_indicator = GetBool(m, "show_mic_indicator", s.show_mic_indicator);
     s.show_replay_indicator = GetBool(m, "show_replay_indicator", s.show_replay_indicator);
+    s.app_clips_allowed = GetBool(m, "app_clips_allowed", s.app_clips_allowed);
+    s.app_clips_crop_to_window = GetBool(m, "app_clips_crop_to_window", s.app_clips_crop_to_window);
+    s.app_clips_app_audio_only = GetBool(m, "app_clips_app_audio_only", s.app_clips_app_audio_only);
     s.hud_corner = std::min(GetU32(m, "hud_corner", s.hud_corner), 3u);
     s.hud_badge_scale = std::clamp(static_cast<float>(GetU32(m, "hud_badge_scale_pct", 100)) / 100.0f,
                                    kHudBadgeScaleMin, kHudBadgeScaleMax);
@@ -208,6 +211,9 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "show_stop_button=" << (show_stop_button ? 1 : 0) << "\n";
     out << "show_mic_indicator=" << (show_mic_indicator ? 1 : 0) << "\n";
     out << "show_replay_indicator=" << (show_replay_indicator ? 1 : 0) << "\n";
+    out << "app_clips_allowed=" << (app_clips_allowed ? 1 : 0) << "\n";
+    out << "app_clips_crop_to_window=" << (app_clips_crop_to_window ? 1 : 0) << "\n";
+    out << "app_clips_app_audio_only=" << (app_clips_app_audio_only ? 1 : 0) << "\n";
     out << "hud_corner=" << hud_corner << "\n";
     out << "hud_badge_scale_pct=" << static_cast<int>(hud_badge_scale * 100.0f + 0.5f) << "\n";
     out << "hud_opacity_pct=" << static_cast<int>(hud_opacity * 100.0f + 0.5f) << "\n";

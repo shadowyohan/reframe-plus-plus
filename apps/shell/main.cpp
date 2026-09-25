@@ -33,6 +33,9 @@
 #include "rf/core/Time.h"
 #include "rf/gallery/Gallery.h"
 #include "rf/engine/Recorder.h"
+#include "rf/engine/UpdateCheck.h"
+#include "rf/integrations/ControlServer.h"
+#include "rf/integrations/SdkHost.h"
 #include "rf/ui/Hud.h"
 #include "rf/ui/Overlay.h"
 #include "rf/ui/Screens.h"
@@ -191,6 +194,19 @@ struct App {
 
     std::atomic<void*> refused_monitor{nullptr};
 
+    rf::integrations::ControlServer control;
+    rf::integrations::SdkHost sdk{RF_VERSION};
+    rf::ClipCropper cropper;
+    rf::UpdateChecker updates;
+    rf::Ticks100ns window_sampled = 0;
+    std::atomic<std::uint64_t> next_toast_id{1};
+
+    std::mutex ui_mutex;
+    std::vector<std::function<void()>> ui_tasks;
+    bool sdk_armed = false;
+    std::uint32_t sdk_buffer_seconds = 0;
+    std::uint32_t sdk_audio_pid = 0;
+
     std::thread engine;
     std::mutex task_mutex;
     std::condition_variable task_cv;
@@ -331,6 +347,14 @@ void SettingsTouched() {
     g_app->settings_touched = rf::Now100ns();
 }
 
+rf::Settings EngineSettings() {
+    const App& app = *g_app;
+    rf::Settings engine = app.settings;
+    engine.replay_enabled = engine.replay_enabled || app.sdk.armed_by_apps();
+    engine.replay_seconds = std::max(engine.replay_seconds, app.sdk.buffer_seconds());
+    return engine;
+}
+
 HHOOK g_key_hook = nullptr;
 
 HHOOK g_mouse_hook = nullptr;
@@ -435,18 +459,18 @@ void SetKeyCaptureHook(bool wanted) {
 }
 
 void RestartRecorder() {
-    PostEngine([] {
+    PostEngine([snapshot = EngineSettings()] {
         App& app = *g_app;
         const bool was_armed = app.recorder.state() != rf::Recorder::State::Idle;
         if (app.recorder.state() == rf::Recorder::State::Recording) app.recorder.StopRecording();
         app.recorder.Shutdown();
 
-        if (auto s = app.recorder.Init(app.settings); !s.ok()) {
+        if (auto s = app.recorder.Init(snapshot); !s.ok()) {
             RF_ERROR("restarting the recorder failed: {}", s.str());
             app.hud.Push(rf::ui::Hud::Kind::Error, "Не удалось переключить видеокарту");
             return;
         }
-        if (was_armed && app.settings.replay_enabled) {
+        if (was_armed && snapshot.replay_enabled) {
             if (auto s = app.recorder.ArmReplay(); !s.ok())
                 RF_ERROR("re-arm after the GPU change: {}", s.str());
         }
@@ -472,8 +496,7 @@ void FlushSettings() {
         return;
     }
 
-    const rf::Settings snapshot = app.settings;
-    PostEngine([snapshot] {
+    PostEngine([snapshot = EngineSettings()] {
         if (auto s = g_app->recorder.ApplySettings(snapshot); !s.ok()) {
             RF_ERROR("applying settings: {}", s.str());
             g_app->hud.Push(rf::ui::Hud::Kind::Error, "Не удалось применить настройки");
@@ -638,10 +661,11 @@ void ToggleRecording() {
 }
 
 void SaveReplay() {
-    PostEngine([] {
+    PostEngine([seconds = g_app->settings.replay_seconds,
+                release_saved = !g_app->sdk.armed_by_apps()] {
     App& app = *g_app;
     std::filesystem::path saved;
-    if (auto s = app.recorder.SaveReplay(&saved); s.ok()) {
+    if (auto s = app.recorder.SaveReplay(&saved, seconds, release_saved); s.ok()) {
 
         const std::string app_name = app.recorder.target_app();
         app.hud.Push(rf::ui::Hud::Kind::ReplaySaved,
@@ -655,6 +679,123 @@ void SaveReplay() {
         app.hud.Push(rf::ui::Hud::Kind::Error, "Повтор недоступен");
     }
     });
+}
+
+void PostUi(std::function<void()> task) {
+    std::scoped_lock lock(g_app->ui_mutex);
+    g_app->ui_tasks.push_back(std::move(task));
+}
+
+void RunUiTasks() {
+    std::vector<std::function<void()>> tasks;
+    {
+        std::scoped_lock lock(g_app->ui_mutex);
+        tasks.swap(g_app->ui_tasks);
+    }
+    for (auto& task : tasks) task();
+}
+
+std::string SavedClipText(const rf::integrations::DueClip& clip) {
+    return rf::TrFormat("Момент из {} сохранен", clip.app);
+}
+
+void ReportAppClip(const rf::integrations::DueClip& clip, const std::filesystem::path& path,
+                   std::uint32_t seconds) {
+    App& app = *g_app;
+    app.control.Send(clip.client, rf::integrations::SdkHost::SavedEvent(
+                                      rf::ToUtf8(path.wstring()), seconds, clip.tags));
+    app.gallery.Refresh();
+}
+
+void SaveAppClip(rf::integrations::DueClip clip) {
+    PostEngine([clip = std::move(clip)] {
+        App& app = *g_app;
+        rf::Recorder::GameClip saved;
+        const rf::Status s = app.recorder.SaveGameClip(
+            clip.app, rf::integrations::JoinTags(clip.tags), clip.seconds, saved);
+        if (!s.ok()) {
+            RF_WARN("SDK clip from {}: {}", clip.app, s.str());
+            const bool empty = app.recorder.GetStatus().replay.video_packets == 0;
+            app.control.Send(clip.client, rf::integrations::SdkHost::FailedEvent(
+                                              empty ? "buffer-empty" : "internal", clip.tags));
+            return;
+        }
+        const std::string thumb = rf::ToUtf8(saved.path.filename().wstring());
+        if (!saved.needs_crop) {
+            PostUi([clip, thumb] {
+                g_app->hud.Push(rf::ui::Hud::Kind::ReplaySaved, SavedClipText(clip), thumb, clip.app);
+            });
+            ReportAppClip(clip, saved.path, saved.seconds);
+            return;
+        }
+
+        const std::uint64_t toast = app.next_toast_id++;
+        PostUi([toast, clip] {
+            g_app->hud.PushProcessing(toast, "Повтор обрабатывается", clip.app);
+        });
+        app.cropper.Push(
+            std::move(saved.crop),
+            [toast](float progress) {
+                PostUi([toast, progress] { g_app->hud.SetProcessingProgress(toast, progress); });
+            },
+            [clip, toast, thumb, seconds = saved.seconds](const rf::Status&,
+                                                          const rf::CropJob& job) {
+                ReportAppClip(clip, job.output, seconds);
+                PostUi([clip, toast, thumb] {
+                    g_app->hud.FinishProcessing(toast, rf::ui::Hud::Kind::ReplaySaved,
+                                                SavedClipText(clip), thumb, clip.app);
+                });
+            });
+    });
+}
+
+void PumpIntegrations() {
+    App& app = *g_app;
+    const rf::Ticks100ns now = rf::Now100ns();
+    using Incoming = rf::integrations::ControlServer::Incoming;
+    for (Incoming& incoming : app.control.Take()) {
+        switch (incoming.kind) {
+            case Incoming::Kind::Connected: app.sdk.Connected(incoming.client, incoming.pid); break;
+            case Incoming::Kind::Closed:    app.sdk.Disconnected(incoming.client); break;
+            case Incoming::Kind::Line:
+                app.control.Send(incoming.client,
+                                 app.sdk.Handle(incoming.client, incoming.text, now));
+                break;
+        }
+    }
+
+    app.sdk.SetAllowed(app.settings.app_clips_allowed);
+    app.sdk.SetUserReplay(app.settings.replay_enabled, app.settings.replay_seconds);
+    app.sdk.SetOverlayOpen(app.menu.open());
+
+    for (const std::string& name : app.sdk.TakeGreetings())
+        app.hud.Push(rf::ui::Hud::Kind::AppSupport,
+                     rf::TrFormat("{} поддерживает reframe++ — моменты могут сохраняться "
+                                  "автоматически",
+                                  name),
+                     {}, name);
+    for (rf::integrations::Outgoing& outgoing : app.sdk.TakeOutgoing())
+        app.control.Send(outgoing.client, std::move(outgoing.line));
+    for (rf::integrations::DueClip& clip : app.sdk.TakeDueClips(now)) SaveAppClip(std::move(clip));
+
+    const bool armed = app.sdk.armed_by_apps();
+    const std::uint32_t seconds = app.sdk.buffer_seconds();
+    if (armed != app.sdk_armed || seconds != app.sdk_buffer_seconds) {
+        app.sdk_armed = armed;
+        app.sdk_buffer_seconds = seconds;
+        app.replay_touched = now;
+        app.replay_pending = true;
+    }
+
+    if (const std::uint32_t pid = app.sdk.audio_pid(); pid != app.sdk_audio_pid) {
+        app.sdk_audio_pid = pid;
+        PostEngine([pid] { g_app->recorder.SetGameAudio(pid); });
+    }
+
+    if (app.sdk_audio_pid && now - app.window_sampled >= rf::kOneSecond100ns / 10) {
+        app.window_sampled = now;
+        app.recorder.SampleGameWindow(app.sdk_audio_pid);
+    }
 }
 
 void SetReplayArmed(bool armed) {
@@ -671,20 +812,18 @@ void ApplyReplayState() {
     if (!app.replay_pending) return;
     if (rf::Now100ns() - app.replay_touched < rf::MsTo100ns(450)) return;
 
-    const bool armed = app.replay_target;
-    const bool already =
-        armed ? app.recorder.state() != rf::Recorder::State::Idle : app.recorder.state() == rf::Recorder::State::Idle;
+    const bool armed = app.replay_target || app.sdk.armed_by_apps();
     app.replay_pending = false;
     app.settings.Save(rf::paths::SettingsFile());
 
-    const rf::Settings snapshot = app.settings;
-    PostEngine([armed, already, snapshot] {
+    PostEngine([armed, snapshot = EngineSettings()] {
     App& app = *g_app;
 
     if (auto s = app.recorder.ApplySettings(snapshot); !s.ok())
         RF_ERROR("applying the replay switch: {}", s.str());
 
-    if (already) return;
+    const bool running = app.recorder.state() != rf::Recorder::State::Idle;
+    if (armed == running) return;
 
     if (armed) {
         if (auto s = app.recorder.ArmReplay(); !s.ok()) {
@@ -730,7 +869,7 @@ void RecoverFromDeviceLoss() {
     if (app.needs_rebind) return;
     app.needs_rebind = true;
 
-    PostEngine([] {
+    PostEngine([snapshot = EngineSettings()] {
         App& app = *g_app;
         RF_WARN("rebuilding the GPU pipeline after a device loss");
 
@@ -739,7 +878,7 @@ void RecoverFromDeviceLoss() {
             app.recorder.StopRecording();
         app.recorder.Shutdown();
 
-        if (auto s = app.recorder.Init(app.settings); !s.ok()) {
+        if (auto s = app.recorder.Init(snapshot); !s.ok()) {
             RF_ERROR("device recovery failed: {}", s.str());
             app.quit = true;
             return;
@@ -748,7 +887,7 @@ void RecoverFromDeviceLoss() {
         app.needs_rebind = false;
         app.pending_rebind = true;
 
-        if (was_armed && app.settings.replay_enabled) {
+        if (was_armed && snapshot.replay_enabled) {
             if (auto s = app.recorder.ArmReplay(); !s.ok())
                 RF_ERROR("re-arm after recovery: {}", s.str());
         }
@@ -857,7 +996,21 @@ bool RelaunchThroughElevatedTask() {
 
 }
 
+std::wstring CropJobArgument(PWSTR command_line) {
+    constexpr std::wstring_view kCropFlag = L"--crop";
+    const std::wstring_view line = command_line ? command_line : L"";
+    const std::size_t flag = line.find(kCropFlag);
+    if (flag == std::wstring_view::npos) return {};
+    std::wstring_view path = line.substr(flag + kCropFlag.size());
+    while (!path.empty() && (path.front() == L' ' || path.front() == L'"')) path.remove_prefix(1);
+    while (!path.empty() && (path.back() == L' ' || path.back() == L'"')) path.remove_suffix(1);
+    return std::wstring(path);
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
+    if (const std::wstring crop_job = CropJobArgument(command_line); !crop_job.empty())
+        return rf::RunCropHelper(crop_job);
+
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     rf::log::Init(rf::log::Level::Info);
     ::AddVectoredExceptionHandler(1, CrashReporter);
@@ -1020,6 +1173,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
                                                      app.settings.hotkey_save_replay_vk);
 
     app.model.settings = &app.settings;
+    app.model.build_line = std::format("reframe++ {} © | Build: {}. All rights reserved",
+                                       RF_VERSION_SHORT, RF_VERSION_BUILD);
     app.model.gallery = &app.gallery;
     app.model.on_toggle_record = ToggleRecording;
     app.model.on_pick_mic = PickMicDevice;
@@ -1050,7 +1205,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
 
     if (app.settings.replay_enabled) SetReplayArmed(true);
 
-    RF_INFO("reframe++ 2.0 build 971, compiled {} {}", __DATE__, __TIME__);
+    if (auto s = app.control.Start(); !s.ok())
+        RF_WARN("SDK server unavailable - games cannot save clips: {}", s.str());
+
+    app.updates.on_update = [](const rf::Release& release) {
+        const std::string version =
+            release.tag.starts_with('v') ? release.tag.substr(1) : release.tag;
+        PostUi([version] {
+            g_app->hud.PushUpdate(
+                rf::TrFormat("Доступна новая версия reframe++ {} — скачайте на GitHub", version),
+                version);
+        });
+    };
+    app.updates.Start(RF_VERSION);
+
+    RF_INFO("reframe++ {} build {}, compiled {} {}", RF_VERSION_SHORT, RF_VERSION_BUILD, __DATE__,
+            __TIME__);
     RF_INFO("reframe++ ready - Alt+Z opens the overlay");
 
     app.watchdog = std::thread(WatchdogLoop);
@@ -1066,6 +1236,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
 
         app.stage = "settings";
         FlushSettings();
+        app.stage = "sdk";
+        PumpIntegrations();
+        RunUiTasks();
+        app.stage = "settings";
         ApplyReplayState();
 
         const bool recording = app.recorder.state() == rf::Recorder::State::Recording;
@@ -1116,8 +1290,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         rf::ui::Hud::Badges badges;
         badges.mic = app.settings.show_mic_indicator && (recording || app.model.replay_armed);
         badges.mic_muted = !app.settings.record_microphone;
-        badges.replay =
-            app.settings.show_replay_indicator && app.model.replay_armed && !recording;
+        const bool armed_by_apps =
+            app.sdk.armed_by_apps() && app.recorder.state() != rf::Recorder::State::Idle;
+        badges.replay = app.settings.show_replay_indicator &&
+                        (app.model.replay_armed || armed_by_apps) && !recording;
         badges.corner = app.settings.hud_corner;
         badges.scale = app.settings.hud_badge_scale;
         badges.opacity = app.settings.hud_opacity;
@@ -1278,6 +1454,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     app.engine_running = false;
     app.task_cv.notify_all();
     if (app.engine.joinable()) app.engine.join();
+    app.updates.Stop();
+    app.cropper.Stop();
+    app.control.Stop();
     if (app.watchdog.joinable()) app.watchdog.join();
 
     app.settings.Save(rf::paths::SettingsFile());

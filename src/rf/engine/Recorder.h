@@ -9,6 +9,7 @@
 #include "rf/audio/AacEncoder.h"
 #include "rf/audio/AppAudioTracks.h"
 #include "rf/audio/NoiseSuppressor.h"
+#include "rf/audio/ProcessAudioTrack.h"
 #include "rf/audio/WasapiCapture.h"
 #include "rf/capture/GameCapture.h"
 #include "rf/capture/GameWatcher.h"
@@ -17,6 +18,7 @@
 #include "rf/engine/Settings.h"
 #include "rf/gpu/ColorConverter.h"
 #include "rf/gpu/FrameBridge.h"
+#include "rf/mux/ClipCropper.h"
 #include "rf/mux/Mp4Muxer.h"
 #include "rf/replay/ReplayBuffer.h"
 
@@ -49,7 +51,20 @@ public:
     Status ArmReplay();
     void DisarmReplay();
 
-    Status SaveReplay(std::filesystem::path* saved_to = nullptr, std::uint32_t seconds = 0);
+    Status SaveReplay(std::filesystem::path* saved_to = nullptr, std::uint32_t seconds = 0,
+                      bool release_saved = true);
+
+    struct GameClip {
+        std::filesystem::path path;
+        std::uint32_t seconds = 0;
+        bool needs_crop = false;
+        CropJob crop;
+    };
+    Status SaveGameClip(const std::string& app, const std::string& tag, std::uint32_t seconds,
+                        GameClip& out);
+
+    void SetGameAudio(std::uint32_t pid);
+    void SampleGameWindow(std::uint32_t pid);
 
     Status StartRecording(const std::filesystem::path& file);
     Status StopRecording();
@@ -108,7 +123,29 @@ private:
     void StopWriter();
     void FlushWriter();
     void WriterLoop();
-    std::filesystem::path MakeOutputPath(const char* suffix) const;
+    std::filesystem::path MakeOutputPath(std::string_view label, std::string_view tail = {}) const;
+    Status WriteClipLocked(const std::filesystem::path& path, Ticks100ns window,
+                           IMFMediaType* audio_type, std::uint32_t audio_tracks,
+                           const std::vector<std::uint32_t>& kept_tracks, Ticks100ns* covered_to);
+
+    struct CaptureGeometry {
+        bool valid = false;
+        bool display = false;
+        bool hooked = false;
+        HWND window = nullptr;
+        RECT monitor{};
+        std::uint32_t source_width = 0, source_height = 0;
+        std::uint32_t video_width = 0, video_height = 0;
+    };
+    void RememberGeometry(const CaptureTarget& target, bool hooked);
+    [[nodiscard]] HWND GameWindowOf(std::uint32_t pid);
+    [[nodiscard]] std::vector<WindowSample> WindowSamplesBetween(Ticks100ns from,
+                                                                 Ticks100ns to) const;
+
+    void StartSystemAudioLocked();
+    void StartGameAudioLocked();
+    void StopGameAudioLocked();
+    void FeedGameAudio(std::uint32_t frames, Ticks100ns timestamp);
 
     void StartPacer();
     void StopPacer();
@@ -196,6 +233,16 @@ private:
     std::unique_ptr<AacEncoder> aac_mic_;
     std::unique_ptr<AacEncoder> aac_system_;
     AppAudioTracks app_tracks_;
+    std::mutex game_audio_mutex_;
+    std::unique_ptr<ProcessAudioTrack> game_audio_;
+    std::uint32_t game_audio_pid_ = 0;
+
+    mutable std::mutex window_mutex_;
+    CaptureGeometry geometry_;
+    std::deque<WindowSample> window_samples_;
+    HWND game_window_ = nullptr;
+    std::uint32_t game_window_pid_ = 0;
+    Ticks100ns game_window_checked_ = 0;
     MicDenoiser denoiser_;
     std::mutex mic_mutex_;
     std::vector<float> mic_fifo_;

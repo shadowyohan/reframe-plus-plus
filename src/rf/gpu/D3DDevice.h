@@ -57,4 +57,6 @@ private:
 
 using D3DDevicePtr = std::shared_ptr<D3DDevice>;
 
+void LowerProcessGpuPriority();
+
 }

@@ -62,6 +62,9 @@ Settings Modified() {
     s.hud_badge_scale = 1.5f;
     s.hud_opacity = 0.4f;
     s.replay_in_memory = true;
+    s.app_clips_allowed = false;
+    s.app_clips_crop_to_window = false;
+    s.app_clips_app_audio_only = false;
     return s;
 }
 
@@ -117,6 +120,9 @@ TEST(Settings_SurviveSaveAndLoad) {
     CHECK(read.hud_badge_scale > 1.49f && read.hud_badge_scale < 1.51f);
     CHECK(read.hud_opacity > 0.39f && read.hud_opacity < 0.41f);
     CHECK(read.replay_in_memory == written.replay_in_memory);
+    CHECK(read.app_clips_allowed == written.app_clips_allowed);
+    CHECK(read.app_clips_crop_to_window == written.app_clips_crop_to_window);
+    CHECK(read.app_clips_app_audio_only == written.app_clips_app_audio_only);
 
     std::error_code ec;
     std::filesystem::remove(TempFile(), ec);
@@ -133,7 +139,9 @@ TEST(Settings_EveryFieldIsWrittenOut) {
                             "ui_scale_pct", "record_microphone", "audio_tracks", "gpu_luid_low",
                             "language", "show_record_indicator", "show_stop_button",
                             "show_mic_indicator", "show_replay_indicator", "hud_corner",
-                            "hud_badge_scale_pct", "hud_opacity_pct", "replay_in_memory"})
+                            "hud_badge_scale_pct", "hud_opacity_pct", "replay_in_memory",
+                            "app_clips_allowed", "app_clips_crop_to_window",
+                            "app_clips_app_audio_only"})
         CHECK(body.find(std::string(key) + "=") != std::string::npos);
 
     std::error_code ec;

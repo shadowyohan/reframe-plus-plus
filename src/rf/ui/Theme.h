@@ -90,6 +90,7 @@ enum class Font {
     Toast,
     Warning,
     WarningBold,
+    Micro,
     Count
 };
 
