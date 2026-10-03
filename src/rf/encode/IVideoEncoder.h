@@ -97,6 +97,8 @@ std::vector<EncoderCapability> ProbeEncoders(const D3DDevicePtr& device);
 
 bool HasHardwareEncoder(GpuVendor vendor, Codec codec);
 
+[[nodiscard]] bool CanDecode(Codec codec);
+
 Status PickEncodingDevice(const D3DDevicePtr& capture, Codec codec, D3DDevicePtr& out);
 
 Status CreateVideoEncoder(const D3DDevicePtr& device, EncoderBackend backend,

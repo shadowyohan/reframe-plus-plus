@@ -108,6 +108,7 @@ add_library(reframe_core STATIC
     rf/mux/Mp4Muxer.cpp
     rf/mux/TrackNames.cpp
     rf/player/VideoPlayer.cpp
+    rf/player/TrackMixer.cpp
     rf/replay/ReplayBuffer.cpp
 
     rf/integrations/ClipScheduler.cpp
@@ -118,6 +119,7 @@ add_library(reframe_core STATIC
     rf/engine/Recorder.cpp
     rf/engine/Settings.cpp
     rf/engine/UpdateCheck.cpp
+    rf/engine/ForegroundTracker.cpp
 
     rf/gallery/Gallery.cpp
 
@@ -125,6 +127,7 @@ add_library(reframe_core STATIC
     rf/ui/Hud.cpp
     rf/ui/Overlay.cpp
     rf/ui/Screens.cpp
+    rf/ui/Editor.cpp
     rf/ui/Widgets.cpp
 )
 

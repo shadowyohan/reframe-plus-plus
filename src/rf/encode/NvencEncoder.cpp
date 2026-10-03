@@ -36,6 +36,8 @@ Status NvencEncoder::Submit(const CapturedFrame&) { return Status::Fail("not bui
 Status NvencEncoder::RequestKeyframe() { return Status::Ok(); }
 Status NvencEncoder::Flush() { return Status::Ok(); }
 Status NvencEncoder::InitSession() { return Status::Fail("not built"); }
+bool NvencEncoder::SupportsCodec(const GUID&) const { return false; }
+
 int NvencEncoder::PickDepth() const { return 0; }
 void NvencEncoder::OutputLoop() {}
 void NvencEncoder::DestroySession() {}
@@ -161,6 +163,75 @@ Status NvencEncoder::InitSession() {
     return Status::Ok();
 }
 
+namespace {
+
+GUID CodecGuid(Codec codec) {
+    switch (codec) {
+        case Codec::HEVC: return NV_ENC_CODEC_HEVC_GUID;
+        case Codec::AV1:  return NV_ENC_CODEC_AV1_GUID;
+        case Codec::H264: break;
+    }
+    return NV_ENC_CODEC_H264_GUID;
+}
+
+void DescribeColour(NV_ENC_CONFIG_H264_VUI_PARAMETERS& vui, bool hdr) {
+    vui.videoSignalTypePresentFlag = 1;
+    vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+    vui.videoFullRangeFlag = 0;
+    vui.colourDescriptionPresentFlag = 1;
+    vui.colourPrimaries = hdr ? NV_ENC_VUI_COLOR_PRIMARIES_BT2020 : NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    vui.transferCharacteristics =
+        hdr ? NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084 : NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    vui.colourMatrix = hdr ? NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL : NV_ENC_VUI_MATRIX_COEFFS_BT709;
+}
+
+void ConfigureCodec(NV_ENC_CONFIG& cfg, Codec codec, std::uint32_t gop, bool hdr) {
+    switch (codec) {
+        case Codec::HEVC: {
+            auto& hevc = cfg.encodeCodecConfig.hevcConfig;
+            hevc.idrPeriod = gop;
+            hevc.repeatSPSPPS = 1;
+            DescribeColour(hevc.hevcVUIParameters, hdr);
+            break;
+        }
+        case Codec::AV1: {
+            auto& av1 = cfg.encodeCodecConfig.av1Config;
+            av1.idrPeriod = gop;
+            av1.repeatSeqHdr = 1;
+            av1.outputAnnexBFormat = 0;
+            av1.chromaFormatIDC = 1;
+            av1.inputBitDepth = NV_ENC_BIT_DEPTH_8;
+            av1.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+            av1.colorRange = 0;
+            av1.colorPrimaries = hdr ? NV_ENC_VUI_COLOR_PRIMARIES_BT2020 : NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+            av1.transferCharacteristics =
+                hdr ? NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084 : NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+            av1.matrixCoefficients = hdr ? NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL : NV_ENC_VUI_MATRIX_COEFFS_BT709;
+            break;
+        }
+        case Codec::H264: {
+            auto& h264 = cfg.encodeCodecConfig.h264Config;
+            h264.idrPeriod = gop;
+            h264.repeatSPSPPS = 1;
+            DescribeColour(h264.h264VUIParameters, hdr);
+            break;
+        }
+    }
+}
+
+}
+
+bool NvencEncoder::SupportsCodec(const GUID& codec) const {
+    std::uint32_t count = 0;
+    if (api_->fn.nvEncGetEncodeGUIDCount(api_->encoder, &count) != NV_ENC_SUCCESS || count == 0)
+        return false;
+    std::vector<GUID> guids(count);
+    std::uint32_t filled = 0;
+    if (api_->fn.nvEncGetEncodeGUIDs(api_->encoder, guids.data(), count, &filled) != NV_ENC_SUCCESS)
+        return false;
+    return std::find(guids.begin(), guids.begin() + filled, codec) != guids.begin() + filled;
+}
+
 int NvencEncoder::PickDepth() const {
     if (!config_.quirks.has(Quirk::Id::EncoderLimitAsyncDepth)) return kMaxDepth;
     const std::uint64_t vram_mib = device_->info().dedicated_vram / (1024 * 1024);
@@ -174,10 +245,10 @@ Status NvencEncoder::Open(const EncoderConfig& config, const PacketCallback& on_
     on_packet_ = on_packet;
     epoch_ = config.epoch;
 
-    if (config.format.codec != Codec::H264)
-        return Status::Fail("NVENC backend currently implements H.264 only");
-
     RF_TRY(InitSession());
+    const GUID codec_guid = CodecGuid(config.format.codec);
+    if (!SupportsCodec(codec_guid))
+        return Status::Fail(std::format("this NVIDIA card cannot encode {}", ToString(config.format.codec)));
 
     const auto& f = config_.format;
     const std::uint32_t fps = std::max(1u, f.fps_num / std::max(1u, f.fps_den));
@@ -194,7 +265,7 @@ Status NvencEncoder::Open(const EncoderConfig& config, const PacketCallback& on_
     NV_ENC_PRESET_CONFIG preset_cfg{};
     preset_cfg.version = NV_ENC_PRESET_CONFIG_VER;
     preset_cfg.presetCfg.version = NV_ENC_CONFIG_VER;
-    RF_NV(api_->fn.nvEncGetEncodePresetConfigEx(api_->encoder, NV_ENC_CODEC_H264_GUID, preset,
+    RF_NV(api_->fn.nvEncGetEncodePresetConfigEx(api_->encoder, codec_guid, preset,
                                                 NV_ENC_TUNING_INFO_LOW_LATENCY, &preset_cfg));
 
     NV_ENC_CONFIG enc_cfg = preset_cfg.presetCfg;
@@ -210,25 +281,11 @@ Status NvencEncoder::Open(const EncoderConfig& config, const PacketCallback& on_
     enc_cfg.rcParams.enableAQ = 1;
 
     enc_cfg.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
-    enc_cfg.encodeCodecConfig.h264Config.idrPeriod = gop;
-    enc_cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-
-    auto& vui = enc_cfg.encodeCodecConfig.h264Config.h264VUIParameters;
-    vui.videoSignalTypePresentFlag = 1;
-    vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-    vui.videoFullRangeFlag = 0;
-    vui.colourDescriptionPresentFlag = 1;
-    const bool hdr = config_.format.color == ColorSpace::Rec2020Pq;
-    vui.colourPrimaries =
-        hdr ? NV_ENC_VUI_COLOR_PRIMARIES_BT2020 : NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-    vui.transferCharacteristics = hdr ? NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084
-                                      : NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-    vui.colourMatrix =
-        hdr ? NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL : NV_ENC_VUI_MATRIX_COEFFS_BT709;
+    ConfigureCodec(enc_cfg, f.codec, gop, f.color == ColorSpace::Rec2020Pq);
 
     NV_ENC_INITIALIZE_PARAMS init{};
     init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    init.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    init.encodeGUID = codec_guid;
     init.presetGUID = preset;
     init.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     init.encodeWidth = f.width;
@@ -303,9 +360,9 @@ Status NvencEncoder::Open(const EncoderConfig& config, const PacketCallback& on_
     running_ = true;
     output_thread_ = std::thread([this] { OutputLoop(); });
 
-    RF_INFO("NVENC session up: {}x{}@{} {} kbps GOP={} preset P{} single-pass async depth={} "
+    RF_INFO("NVENC {} session up: {}x{}@{} {} kbps GOP={} preset P{} single-pass async depth={} "
             "input={}",
-            f.width, f.height, fps, config_.bitrate_kbps, gop,
+            ToString(f.codec), f.width, f.height, fps, config_.bitrate_kbps, gop,
             q >= 80 ? 5 : q >= 60 ? 4 : q >= 40 ? 3 : 2, depth_,
             direct_rgb_ ? "BGRA direct" : "NV12 via the video processor (scaling)");
     return Status::Ok();

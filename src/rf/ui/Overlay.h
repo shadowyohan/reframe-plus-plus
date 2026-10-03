@@ -41,6 +41,9 @@ public:
 
     void SetVisible(bool visible);
 
+    void FollowMonitor(HMONITOR monitor);
+    [[nodiscard]] RECT bounds() const { return bounds_; }
+
     void SetShape(const std::vector<ImVec4>& rects);
 
     Status SetMirrorToSharedSurface(bool enabled);
@@ -81,6 +84,7 @@ private:
     void ReleaseRenderTarget();
     Status CreateRenderTarget();
     void Resize(UINT width, UINT height);
+    [[nodiscard]] ImVec2 ExternalPosInLayout() const;
 
     D3DDevicePtr device_;
     HWND hwnd_ = nullptr;
@@ -116,6 +120,8 @@ private:
 
     void ApplyInputStyle();
 
+    HMONITOR monitor_ = nullptr;
+    RECT bounds_{};
     UINT width_ = 0, height_ = 0;
     float dpi_scale_ = 1.0f;
     bool interactive_ = false;

@@ -11,6 +11,8 @@
 #include "rf/audio/NoiseSuppressor.h"
 #include "rf/audio/ProcessAudioTrack.h"
 #include "rf/audio/WasapiCapture.h"
+#include "rf/engine/ForegroundTracker.h"
+#include "rf/mux/TrackNames.h"
 #include "rf/capture/GameCapture.h"
 #include "rf/capture/GameWatcher.h"
 #include "rf/capture/IVideoCapture.h"
@@ -52,16 +54,26 @@ public:
     void DisarmReplay();
 
     Status SaveReplay(std::filesystem::path* saved_to = nullptr, std::uint32_t seconds = 0,
-                      bool release_saved = true);
+                      bool release_saved = true, std::string* app_in_frame = nullptr);
+
+    void RecordForegroundApp(std::string app) { foreground_.Record(Now100ns(), std::move(app)); }
+    [[nodiscard]] bool tracks_foreground_app() const {
+        return settings_.name_clips_by_app && !settings_.capture_focused_window_only;
+    }
 
     struct GameClip {
         std::filesystem::path path;
         std::uint32_t seconds = 0;
         bool needs_crop = false;
         CropJob crop;
+        std::vector<ClipMarker> markers;
+    };
+    struct Moment {
+        Ticks100ns at = 0;
+        std::string tag;
     };
     Status SaveGameClip(const std::string& app, const std::string& tag, std::uint32_t seconds,
-                        GameClip& out);
+                        const std::vector<Moment>& moments, GameClip& out);
 
     void SetGameAudio(std::uint32_t pid);
     void SampleGameWindow(std::uint32_t pid);
@@ -124,6 +136,7 @@ private:
     void FlushWriter();
     void WriterLoop();
     std::filesystem::path MakeOutputPath(std::string_view label, std::string_view tail = {}) const;
+    [[nodiscard]] std::string AppInFrameLocked(Ticks100ns from_pts, Ticks100ns to_pts) const;
     Status WriteClipLocked(const std::filesystem::path& path, Ticks100ns window,
                            IMFMediaType* audio_type, std::uint32_t audio_tracks,
                            const std::vector<std::uint32_t>& kept_tracks, Ticks100ns* covered_to);
@@ -187,6 +200,7 @@ private:
     VideoEncoderPtr encoder_;
     std::unique_ptr<WasapiCapture> system_audio_;
     std::unique_ptr<WasapiCapture> microphone_;
+    ForegroundTracker foreground_;
     ReplayBuffer replay_;
 
     std::mutex mux_mutex_;

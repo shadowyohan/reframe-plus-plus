@@ -33,6 +33,7 @@ private:
 
     Status InitSession();
     int PickDepth() const;
+    [[nodiscard]] bool SupportsCodec(const GUID& codec) const;
     void DestroySession();
     void OutputLoop();
     Status EncodeTexture(ID3D11Texture2D* input, Ticks100ns timestamp);

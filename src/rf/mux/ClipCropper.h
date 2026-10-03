@@ -34,6 +34,13 @@ struct FramePlan {
     PixelRect source;
 };
 
+struct AudioEdit {
+    bool keep = true;
+    float gain = 1.0f;
+
+    [[nodiscard]] bool reencodes() const { return keep && gain != 1.0f; }
+};
+
 struct CropJob {
     std::filesystem::path raw;
     std::filesystem::path output;
@@ -44,6 +51,16 @@ struct CropJob {
     std::vector<std::string> audio_names;
     bool first_track_is_full_mix = false;
     bool use_gpu = true;
+    Ticks100ns trim_start = 0;
+    Ticks100ns trim_end = 0;
+    std::vector<AudioEdit> audio_edits;
+    bool keep_raw = false;
+    bool background = true;
+    int codec = -1;
+
+    [[nodiscard]] bool copies_video() const {
+        return samples.empty() && trim_start == 0 && trim_end == 0;
+    }
 };
 
 [[nodiscard]] bool NeedsCropping(const std::vector<WindowSample>& samples,

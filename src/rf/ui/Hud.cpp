@@ -13,6 +13,8 @@ using namespace theme;
 
 constexpr float kToastLifetime = 3.5f;
 constexpr float kUpdateToastLifetime = 10.0f;
+constexpr float kDownloadButtonW = 92.0f;
+constexpr float kDownloadButtonH = 34.0f;
 
 constexpr float kIconDelaySaved = 0.18f;
 constexpr float kIconDelay = 0.13f;
@@ -159,9 +161,10 @@ void Hud::PushProcessing(std::uint64_t id, std::string text, std::string app) {
     toasts_.back().progress = 0.0f;
 }
 
-void Hud::PushUpdate(std::string text, std::string version) {
+void Hud::PushUpdate(std::string text, std::string version, bool can_download) {
     Push(Kind::Update, std::move(text), {}, std::move(version));
     toasts_.back().lifetime = kUpdateToastLifetime;
+    toasts_.back().offers_download = can_download;
 }
 
 void Hud::SetProcessingProgress(std::uint64_t id, float progress) {
@@ -189,7 +192,7 @@ void Hud::FinishProcessing(std::uint64_t id, Kind kind, std::string text, std::s
     it->icon.Reset(0.0f);
 }
 
-void Hud::SetDownload(std::string text, std::string product, float progress) {
+void Hud::SetDownload(std::string text, std::string product, float progress, std::string icon) {
     auto it = std::find_if(toasts_.begin(), toasts_.end(),
                            [](const Toast& t) { return t.kind == Kind::Download && t.sticky; });
     if (it == toasts_.end()) {
@@ -199,6 +202,7 @@ void Hud::SetDownload(std::string text, std::string product, float progress) {
     }
     it->text = std::move(text);
     it->app = std::move(product);
+    it->icon_name = std::move(icon);
     it->progress = std::clamp(progress, 0.0f, 1.0f);
     it->subtitle = std::format("{} / 100%", static_cast<int>(it->progress * 100.0f + 0.5f));
 }
@@ -271,37 +275,10 @@ void Hud::DrawToastIcon(UiContext& ctx, const Toast& toast, ImVec2 card_pos,
 
         case Kind::Processing: {
             ctx.alpha = saved_alpha * std::clamp((toast.age - kIconDelay) / 0.25f, 0.0f, 1.0f);
-            constexpr float kRing = 50.0f, kRadius = 22.0f, kThickness = 6.0f;
-            constexpr ImU32 kRingTrack = IM_COL32(255, 255, 255, 51);
-            constexpr ImVec2 kLabel(25.0f, 11.0f);
-            const ImVec2 origin(card_pos.x + 20.0f, card_pos.y + (kToastH - kRing) * 0.5f);
-            const ImVec2 center(origin.x + kRing * 0.5f, origin.y + kRing * 0.5f);
-            ctx.dl->AddCircle(ctx.At(center), kRadius, ctx.Fade(kRingTrack), 64, kThickness);
-
-            const float progress = std::clamp(toast.progress, 0.0f, 1.0f);
-            if (progress > 0.0f) {
-                const float start = -90.0f * kDegToRad;
-                const float end = start + progress * 360.0f * kDegToRad;
-                ctx.dl->PathArcTo(ctx.At(center), kRadius, start, end, 64);
-                ctx.dl->PathStroke(ctx.Fade(kAppAccent), 0, kThickness);
-                for (const float angle : {start, end})
-                    ctx.dl->AddCircleFilled(
-                        ctx.At(ImVec2(center.x + std::cos(angle) * kRadius,
-                                      center.y + std::sin(angle) * kRadius)),
-                        kThickness * 0.5f, ctx.Fade(kAppAccent), 16);
-            }
-
-            const ImVec2 label_min(origin.x + 12.5f, origin.y + 20.0f);
-            ctx.dl->AddRectFilled(ctx.At(label_min),
-                                  ctx.At(ImVec2(label_min.x + kLabel.x, label_min.y + kLabel.y)),
-                                  ctx.Fade(kRingTrack), 3.0f);
-            const std::string percent =
-                std::format("{}%", static_cast<int>(progress * 100.0f + 0.5f));
-            const ImVec2 size = MeasureText(ctx, Font::Micro, percent.c_str());
-            DrawText(ctx, Font::Micro,
-                     ImVec2(label_min.x + (kLabel.x - size.x) * 0.5f,
-                            label_min.y + (kLabel.y - size.y) * 0.5f),
-                     kText, percent.c_str());
+            constexpr float kRing = 50.0f;
+            DrawProgressRing(ctx,
+                             ImVec2(card_pos.x + 20.0f + kRing * 0.5f, card_pos.y + kToastH * 0.5f),
+                             toast.progress);
             break;
         }
 
@@ -309,7 +286,7 @@ void Hud::DrawToastIcon(UiContext& ctx, const Toast& toast, ImVec2 card_pos,
         case Kind::Download: {
             ctx.alpha = saved_alpha * std::clamp((toast.age - kIconDelay) / 0.3f, 0.0f, 1.0f);
             const float height = toast.kind == Kind::Download ? 54.0f : 50.0f;
-            DrawIcon(ctx, IconFor(toast.kind),
+            DrawIcon(ctx, toast.icon_name.empty() ? IconFor(toast.kind) : toast.icon_name.c_str(),
                      ImVec2(card_pos.x + 20.0f, card_pos.y + (kToastH - height) * 0.5f), height,
                      kText, std::clamp(t, 0.0f, 1.2f));
             break;
@@ -327,26 +304,108 @@ void Hud::DrawToastIcon(UiContext& ctx, const Toast& toast, ImVec2 card_pos,
     ctx.alpha = saved_alpha;
 }
 
+void Hud::DrawDownloadButton(UiContext& ctx, Toast& toast, ImVec2 card_pos) {
+    const ImVec2 min(card_pos.x + kToastW - 20.0f - kDownloadButtonW,
+                     card_pos.y + (kToastH - kDownloadButtonH) * 0.5f);
+    const ImVec2 max(min.x + kDownloadButtonW, min.y + kDownloadButtonH);
+    button_rects_.push_back(ImVec4(min.x, min.y, max.x, max.y));
+
+    const Interaction it = Hit(ctx, HashId("update-download"), min, max);
+    const float grow = 2.0f * it.hover - 2.0f * it.press;
+    ctx.dl->AddRectFilled(ImVec2(min.x - grow, min.y - grow), ImVec2(max.x + grow, max.y + grow),
+                          ctx.Fade(kAppAccent), 10.0f);
+    const char* label = Tr("Скачать");
+    const ImVec2 size = MeasureText(ctx, Font::Body, label);
+    DrawText(ctx, Font::Body,
+             ImVec2(min.x + (kDownloadButtonW - size.x) * 0.5f,
+                    min.y + (kDownloadButtonH - size.y) * 0.5f),
+             kText, label);
+
+    if (it.clicked) {
+        toast.offers_download = false;
+        toast.age = std::max(toast.age, toast.lifetime);
+        if (on_download_update) on_download_update();
+    }
+}
+
 void Hud::SetChrome(bool indicator, bool stop_button) {
     show_indicator_ = indicator;
     show_stop_ = stop_button;
     if (!indicator) pill_.SetTarget(0.0f);
 }
 
-void Hud::DrawBadges(UiContext& ctx, ImVec2 screen) {
-    if (!badges_.mic && !badges_.replay) return;
+namespace {
 
-    constexpr float kBase = 24.0f, kGap = 5.0f, kMargin = 12.0f;
+constexpr float kBadgeMargin = 12.0f;
+constexpr ImVec2 kPillMargin{52.0f, 50.0f};
+constexpr float kSnapDistance = 14.0f;
+constexpr double kPreviewSeconds = 42.0;
+
+ImVec2 PlaceGroup(ImVec2 screen, ImVec2 size, std::uint32_t corner, ImVec2 at, ImVec2 margin) {
+    if (corner == Hud::kCustomCorner)
+        return {std::clamp(at.x * screen.x, 0.0f, std::max(0.0f, screen.x - size.x)),
+                std::clamp(at.y * screen.y, 0.0f, std::max(0.0f, screen.y - size.y))};
+    const bool right = corner == 1 || corner == 3;
+    const bool bottom = corner >= 2;
+    return {right ? screen.x - margin.x - size.x : margin.x,
+            bottom ? screen.y - margin.y - size.y : margin.y};
+}
+
+float Snap(float value, std::initializer_list<float> anchors) {
+    for (const float anchor : anchors)
+        if (std::abs(value - anchor) < kSnapDistance) return anchor;
+    return value;
+}
+
+void ScaleVertices(ImDrawList* dl, int from, ImVec2 pivot, float scale) {
+    if (scale == 1.0f) return;
+    for (int i = from; i < dl->VtxBuffer.Size; ++i) {
+        ImVec2& p = dl->VtxBuffer[i].pos;
+        p = ImVec2(pivot.x + (p.x - pivot.x) * scale, pivot.y + (p.y - pivot.y) * scale);
+    }
+}
+
+}
+
+ImVec2 Hud::DragGroup(UiContext& ctx, std::uint32_t id, ImVec2 pos, ImVec2 size, ImVec2 screen,
+                      ImVec2 margin, bool& moved) {
+    if (!editing_layout_) return pos;
+    const Interaction it = Hit(ctx, id, pos, ImVec2(pos.x + size.x, pos.y + size.y), false);
+    if (ctx.mouse_pressed && it.hovered) grab_ = ImVec2(ctx.mouse.x - pos.x, ctx.mouse.y - pos.y);
+    ctx.dl->AddRect(ImVec2(pos.x - 5.0f, pos.y - 5.0f), ImVec2(pos.x + size.x + 5.0f, pos.y + size.y + 5.0f),
+                    IM_COL32(0xa0, 0x99, 0xff, 110 + static_cast<int>(120 * it.hover)), 12.0f, 0, 2.0f);
+    if (!ctx.mouse_down || ctx.active_id != id) return pos;
+
+    ImVec2 next(ctx.mouse.x - grab_.x, ctx.mouse.y - grab_.y);
+    next.x = Snap(next.x, {margin.x, screen.x - margin.x - size.x, (screen.x - size.x) * 0.5f});
+    next.y = Snap(next.y, {margin.y, screen.y - margin.y - size.y, (screen.y - size.y) * 0.5f});
+    next.x = std::clamp(next.x, 0.0f, std::max(0.0f, screen.x - size.x));
+    next.y = std::clamp(next.y, 0.0f, std::max(0.0f, screen.y - size.y));
+    moved = true;
+    return next;
+}
+
+void Hud::DrawBadges(UiContext& ctx, ImVec2 screen, bool& moved) {
+    const bool mic = badges_.mic || editing_layout_;
+    const bool replay = badges_.replay || editing_layout_;
+    if (!mic && !replay) return;
+
+    constexpr float kBase = 24.0f, kGap = 5.0f;
     const float size = kBase * badges_.scale;
-    const int count = (badges_.mic ? 1 : 0) + (badges_.replay ? 1 : 0);
-    const float column = count * size + (count - 1) * kGap;
+    const int count = (mic ? 1 : 0) + (replay ? 1 : 0);
+    const ImVec2 group(size, count * size + (count - 1) * kGap);
 
-    const bool right = badges_.corner == 1 || badges_.corner == 3;
-    const bool bottom = badges_.corner >= 2;
+    const ImVec2 placed = PlaceGroup(screen, group, badges_.corner, badges_.badges_at,
+                                     ImVec2(kBadgeMargin, kBadgeMargin));
+    const ImVec2 origin = DragGroup(ctx, HashId("hud-badges"), placed, group, screen,
+                                    ImVec2(kBadgeMargin, kBadgeMargin), moved);
+    if (origin.x != placed.x || origin.y != placed.y) {
+        badges_.corner = kCustomCorner;
+        badges_.badges_at = ImVec2(origin.x / screen.x, origin.y / screen.y);
+    }
 
-    const float x = right ? screen.x - kMargin - size : kMargin;
-    float y = bottom ? screen.y - kMargin - column : kMargin;
-
+    const float x = origin.x;
+    float y = origin.y;
     const float saved = ctx.alpha;
     ctx.alpha = saved * badges_.opacity;
 
@@ -369,19 +428,23 @@ void Hud::DrawBadges(UiContext& ctx, ImVec2 screen) {
         y += size + kGap;
     };
 
-    if (badges_.mic) badge("microphone", badges_.mic_muted);
-    if (badges_.replay) badge("repeat-circle", false);
+    if (mic) badge("microphone", badges_.mic_muted && !editing_layout_);
+    if (replay) badge("repeat-circle", false);
 
     ctx.alpha = saved;
 }
 
 void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
+    if (editing_layout_) pill_.SetTarget(1.0f);
     const float pill = pill_.Update(ctx.dt, spring::kPill);
     pill_rect_ = ImVec4(0, 0, 0, 0);
     hit_rects_.clear();
-    DrawBadges(ctx, screen);
+    button_rects_.clear();
+    bool moved = false;
+    DrawBadges(ctx, screen, moved);
     if (pill > 0.01f) {
-        const int total_seconds = static_cast<int>(recording_seconds_);
+        const double seconds = editing_layout_ && !recording_ ? kPreviewSeconds : recording_seconds_;
+        const int total_seconds = static_cast<int>(seconds);
         const int hours = total_seconds / 3600;
         const std::string time =
             hours > 0 ? std::format("{:02}:{:02}:{:02}", hours, total_seconds / 60 % 60,
@@ -412,20 +475,36 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
         const float w = kPad + kDot + kGap + (has_chip ? chip_w + kGap : 0.0f) + text_size.x +
                         (show_stop_ ? kGap + kStopBtn : 0.0f) + kPad;
 
-        const ImVec2 center(52.0f + w * 0.5f, 50.0f + kPillH * 0.5f);
+        const float scale = badges_.scale;
+        const ImVec2 scaled_size(w * scale, kPillH * scale);
+        const ImVec2 placed = PlaceGroup(screen, scaled_size, badges_.record_corner, badges_.record_at, kPillMargin);
+        const ImVec2 origin = DragGroup(ctx, HashId("hud-pill"), placed, scaled_size, screen, kPillMargin, moved);
+        if (origin.x != placed.x || origin.y != placed.y) {
+            badges_.record_corner = kCustomCorner;
+            badges_.record_at = ImVec2(origin.x / screen.x, origin.y / screen.y);
+        }
+
+        const int first_vertex = ctx.dl->VtxBuffer.Size;
+        const ImVec2 real_mouse = ctx.mouse;
+        ctx.mouse = ImVec2(origin.x + (real_mouse.x - origin.x) / scale,
+                           origin.y + (real_mouse.y - origin.y) / scale);
+        const float outer_alpha = ctx.alpha;
+        ctx.alpha = outer_alpha * badges_.opacity;
+
+        const ImVec2 center(origin.x + w * 0.5f, origin.y + kPillH * 0.5f);
         const ImVec2 half(w * 0.5f * pill, kPillH * 0.5f * pill);
         const ImVec2 pmin(center.x - half.x, center.y - half.y);
         const ImVec2 pmax(center.x + half.x, center.y + half.y);
-        ctx.dl->AddRectFilled(pmin, pmax, kPanelBg, kPillRadius * pill);
-        ctx.dl->AddRect(pmin, pmax, IM_COL32(255, 255, 255, 26), kPillRadius * pill, 0, 1.0f);
+        ctx.dl->AddRectFilled(pmin, pmax, ctx.Fade(kPanelBg), kPillRadius * pill);
+        ctx.dl->AddRect(pmin, pmax, ctx.Fade(IM_COL32(255, 255, 255, 26)), kPillRadius * pill, 0, 1.0f);
 
         if (pill > 0.5f) {
             const float alpha = std::clamp((pill - 0.5f) * 2.0f, 0.0f, 1.0f);
             const float saved = ctx.alpha;
-            ctx.alpha = alpha;
+            ctx.alpha = saved * alpha;
 
-            float x = 52.0f + kPad;
-            const float pulse = 0.78f + 0.22f * std::sin(static_cast<float>(recording_seconds_) * 4.0f);
+            float x = origin.x + kPad;
+            const float pulse = 0.78f + 0.22f * std::sin(static_cast<float>(seconds) * 4.0f);
             ctx.dl->AddCircleFilled(ImVec2(x + kDot * 0.5f, center.y), kDot * 0.5f * pulse,
                                     ctx.Fade(kDanger), 20);
             x += kDot + kGap;
@@ -452,26 +531,34 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
             x += text_size.x + kGap;
 
             if (show_stop_) {
-            const ImVec2 bpos(x, center.y - kStopBtn * 0.5f);
-            Interaction it = Hit(ctx, HashId("pill-stop"), bpos,
-                                 ImVec2(bpos.x + kStopBtn, bpos.y + kStopBtn));
-            const float bs = 1.0f + 0.12f * it.hover - 0.12f * it.press;
-            const ImVec2 bc(bpos.x + kStopBtn * 0.5f, bpos.y + kStopBtn * 0.5f);
-            ctx.dl->AddCircleFilled(bc, kStopBtn * 0.5f * bs,
-                                    ctx.Fade(IM_COL32(217, 217, 217, 51 + static_cast<int>(30 * it.hover))),
-                                    32);
-            const float sq = 4.5f * bs;
-            ctx.dl->AddRectFilled(ImVec2(bc.x - sq, bc.y - sq), ImVec2(bc.x + sq, bc.y + sq),
-                                  ctx.Fade(kText), 2.0f);
-            if (it.clicked && on_stop) on_stop();
+                const ImVec2 bpos(x, center.y - kStopBtn * 0.5f);
+                Interaction it = editing_layout_
+                                     ? Interaction{}
+                                     : Hit(ctx, HashId("pill-stop"), bpos,
+                                           ImVec2(bpos.x + kStopBtn, bpos.y + kStopBtn));
+                const float bs = 1.0f + 0.12f * it.hover - 0.12f * it.press;
+                const ImVec2 bc(bpos.x + kStopBtn * 0.5f, bpos.y + kStopBtn * 0.5f);
+                ctx.dl->AddCircleFilled(
+                    bc, kStopBtn * 0.5f * bs,
+                    ctx.Fade(IM_COL32(217, 217, 217, 51 + static_cast<int>(30 * it.hover))), 32);
+                const float sq = 4.5f * bs;
+                ctx.dl->AddRectFilled(ImVec2(bc.x - sq, bc.y - sq), ImVec2(bc.x + sq, bc.y + sq),
+                                      ctx.Fade(kText), 2.0f);
+                if (it.clicked && on_stop) on_stop();
             }
 
             ctx.alpha = saved;
         }
 
-        pill_rect_ = ImVec4(pmin.x, pmin.y, pmax.x, pmax.y);
+        ctx.alpha = outer_alpha;
+        ctx.mouse = real_mouse;
+        ScaleVertices(ctx.dl, first_vertex, origin, scale);
+
+        pill_rect_ = ImVec4(origin.x + (pmin.x - origin.x) * scale, origin.y + (pmin.y - origin.y) * scale,
+                            origin.x + (pmax.x - origin.x) * scale, origin.y + (pmax.y - origin.y) * scale);
         hit_rects_.push_back(pill_rect_);
     }
+    if (moved && on_layout_moved) on_layout_moved(badges_);
 
     float y = kToastMargin;
     for (auto& toast : toasts_) {
@@ -488,6 +575,11 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
         const float total_w = kToastBadge + 18.5f + kToastW;
         const float left = screen.x - kToastMargin - total_w + x;
         hit_rects_.push_back(ImVec4(left, y, left + total_w, y + kToastBadge));
+
+        const bool hovered = ctx.interactive && ctx.mouse.x >= left && ctx.mouse.x <= left + total_w &&
+                             ctx.mouse.y >= y && ctx.mouse.y <= y + kToastBadge;
+        if (hovered && toast.offers_download && !toast.leaving)
+            toast.age = std::min(toast.age, toast.lifetime - 0.5f);
 
         ctx.dl->AddRectFilled(ImVec2(left, y), ImVec2(left + kToastBadge, y + kToastBadge),
                               kPanelBg, kToastRadius);
@@ -514,9 +606,11 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
         const float saved_alpha = ctx.alpha;
         ctx.alpha = std::clamp((toast.age - kTextDelay) / kTextFade, 0.0f, 1.0f);
         const float label_x = card_x + (HasWideIcon(toast.kind) ? 108.0f : 100.0f);
-        const float label_w = card_x + kToastW - 22.0f - label_x;
+        const float button_w = toast.offers_download ? kDownloadButtonW + 12.0f : 0.0f;
+        const float label_w = card_x + kToastW - 22.0f - label_x - button_w;
         const float line_h = MeasureText(ctx, Font::Toast, "M").y;
-        const ImU32 accent = toast.kind == Kind::Download ? kNvidiaGreen : kAppAccent;
+        const ImU32 accent =
+            toast.kind == Kind::Download && toast.icon_name == "nvidia" ? kNvidiaGreen : kAppAccent;
         const auto words = SplitAccented(ctx, toast.text, toast.app);
 
         if (toast.subtitle.empty()) {
@@ -544,6 +638,8 @@ void Hud::Draw(UiContext& ctx, ImVec2 screen, const TextureCache& textures) {
             }
             DrawText(ctx, Font::Tiny, ImVec2(label_x, top), kTextMuted, toast.subtitle.c_str());
         }
+
+        if (toast.offers_download) DrawDownloadButton(ctx, toast, ImVec2(card_x, card_y));
 
         ctx.alpha = saved_alpha;
         ctx.offset = saved_offset;

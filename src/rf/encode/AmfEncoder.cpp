@@ -5,6 +5,8 @@
 #include "rf/core/Log.h"
 
 #ifdef RF_HAS_AMF
+#include <components/VideoEncoderAV1.h>
+#include <components/VideoEncoderHEVC.h>
 #include <components/VideoEncoderVCE.h>
 #include <core/Factory.h>
 #include <core/Version.h>
@@ -94,13 +96,114 @@ bool AmfEncoder::Available() {
     return has_entry;
 }
 
+namespace {
+
+const wchar_t* ComponentFor(Codec codec) {
+    switch (codec) {
+        case Codec::HEVC: return AMFVideoEncoder_HEVC;
+        case Codec::AV1:  return AMFVideoEncoder_AV1;
+        case Codec::H264: break;
+    }
+    return AMFVideoEncoderVCE_AVC;
+}
+
+void ConfigureH264(amf::AMFComponent* enc, const EncoderConfig& config, std::uint32_t gop,
+                   std::uint32_t peak) {
+    enc->SetProperty(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_TRANSCODING);
+    enc->SetProperty(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_HIGH);
+    enc->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
+                     config.quality_vs_speed >= 80 ? AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY
+                     : config.quality_vs_speed >= 40 ? AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED
+                                                     : AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
+    enc->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, ::AMFConstructRate(config.format.fps_num, config.format.fps_den));
+    enc->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, static_cast<amf_int64>(config.bitrate_kbps) * 1000);
+    enc->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, static_cast<amf_int64>(peak) * 1000);
+    enc->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+                     config.rate_control == RateControl::VBR
+                         ? AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR
+                         : AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
+    enc->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(gop));
+    enc->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, static_cast<amf_int64>(0));
+    enc->SetProperty(AMF_VIDEO_ENCODER_DE_BLOCKING_FILTER, true);
+    enc->SetProperty(AMF_VIDEO_ENCODER_ENABLE_VBAQ, true);
+}
+
+void ConfigureHevc(amf::AMFComponent* enc, const EncoderConfig& config, std::uint32_t gop,
+                   std::uint32_t peak) {
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_USAGE, AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING);
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE, AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN);
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
+                     config.quality_vs_speed >= 80 ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY
+                     : config.quality_vs_speed >= 40 ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED
+                                                     : AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED);
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMERATE,
+                     ::AMFConstructRate(config.format.fps_num, config.format.fps_den));
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, static_cast<amf_int64>(config.bitrate_kbps) * 1000);
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, static_cast<amf_int64>(peak) * 1000);
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
+                     config.rate_control == RateControl::VBR
+                         ? AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR
+                         : AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR);
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, static_cast<amf_int64>(gop));
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, static_cast<amf_int64>(1));
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
+                     AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED);
+    enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, true);
+}
+
+void ConfigureAv1(amf::AMFComponent* enc, const EncoderConfig& config, std::uint32_t gop,
+                  std::uint32_t peak) {
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_USAGE, AMF_VIDEO_ENCODER_AV1_USAGE_TRANSCODING);
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET,
+                     config.quality_vs_speed >= 80 ? AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET_QUALITY
+                     : config.quality_vs_speed >= 40 ? AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET_BALANCED
+                                                     : AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET_SPEED);
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE, AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS);
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_FRAMERATE,
+                     ::AMFConstructRate(config.format.fps_num, config.format.fps_den));
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE, static_cast<amf_int64>(config.bitrate_kbps) * 1000);
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE, static_cast<amf_int64>(peak) * 1000);
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD,
+                     config.rate_control == RateControl::VBR
+                         ? AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR
+                         : AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_CBR);
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_GOP_SIZE, static_cast<amf_int64>(gop));
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_HEADER_INSERTION_MODE,
+                     AMF_VIDEO_ENCODER_AV1_HEADER_INSERTION_MODE_KEY_FRAME_ALIGNED);
+    enc->SetProperty(AMF_VIDEO_ENCODER_AV1_AQ_MODE, AMF_VIDEO_ENCODER_AV1_AQ_MODE_CAQ);
+}
+
+const wchar_t* ExtraDataProperty(Codec codec) {
+    switch (codec) {
+        case Codec::HEVC: return AMF_VIDEO_ENCODER_HEVC_EXTRADATA;
+        case Codec::AV1:  return AMF_VIDEO_ENCODER_AV1_EXTRA_DATA;
+        case Codec::H264: break;
+    }
+    return AMF_VIDEO_ENCODER_EXTRADATA;
+}
+
+bool IsKeyframe(amf::AMFBuffer* buffer, Codec codec) {
+    amf_int64 type = -1;
+    switch (codec) {
+        case Codec::HEVC:
+            buffer->GetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE, &type);
+            return type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_IDR ||
+                   type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_I;
+        case Codec::AV1:
+            buffer->GetProperty(AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE, &type);
+            return type == AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE_KEY;
+        case Codec::H264: break;
+    }
+    buffer->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type);
+    return type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR || type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_I;
+}
+
+}
+
 Status AmfEncoder::Open(const EncoderConfig& config, const PacketCallback& on_packet) {
     config_ = config;
     on_packet_ = on_packet;
     epoch_ = config.epoch;
-
-    if (config.format.codec != Codec::H264)
-        return Status::Fail("AMF backend currently implements H.264 only");
 
     api_ = std::make_unique<Api>();
 
@@ -113,41 +216,26 @@ Status AmfEncoder::Open(const EncoderConfig& config, const PacketCallback& on_pa
     RF_AMF(init(AMF_FULL_VERSION, &api_->factory));
     RF_AMF(api_->factory->CreateContext(&api_->context));
     RF_AMF(api_->context->InitDX11(device_->device(), amf::AMF_DX11_0));
-    RF_AMF(api_->factory->CreateComponent(api_->context, AMFVideoEncoderVCE_AVC, &api_->encoder));
+    RF_AMF(api_->factory->CreateComponent(api_->context, ComponentFor(config.format.codec), &api_->encoder));
 
     const auto& f = config_.format;
     const std::uint32_t fps = std::max(1u, f.fps_num / std::max(1u, f.fps_den));
     const std::uint32_t gop = std::max(1u, fps * config_.keyframe_interval_ms / 1000);
 
     amf::AMFComponent* enc = api_->encoder;
-
-    enc->SetProperty(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_TRANSCODING);
-    enc->SetProperty(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_HIGH);
-    enc->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
-                     config_.quality_vs_speed >= 80 ? AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY
-                     : config_.quality_vs_speed >= 40 ? AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED
-                                                      : AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
-    enc->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, ::AMFConstructRate(f.fps_num, f.fps_den));
-    enc->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE,
-                     static_cast<amf_int64>(config_.bitrate_kbps) * 1000);
-
     const std::uint32_t peak =
         config_.max_bitrate_kbps ? config_.max_bitrate_kbps : config_.bitrate_kbps * 3 / 2;
-    enc->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, static_cast<amf_int64>(peak) * 1000);
-    enc->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-                     config_.rate_control == RateControl::VBR
-                         ? AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR
-                         : AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
-    enc->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(gop));
-    enc->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, static_cast<amf_int64>(0));
-    enc->SetProperty(AMF_VIDEO_ENCODER_DE_BLOCKING_FILTER, true);
-    enc->SetProperty(AMF_VIDEO_ENCODER_ENABLE_VBAQ, true);
+    switch (f.codec) {
+        case Codec::HEVC: ConfigureHevc(enc, config_, gop, peak); break;
+        case Codec::AV1:  ConfigureAv1(enc, config_, gop, peak); break;
+        case Codec::H264: ConfigureH264(enc, config_, gop, peak); break;
+    }
 
     RF_AMF(enc->Init(amf::AMF_SURFACE_BGRA, static_cast<amf_int32>(f.width),
                      static_cast<amf_int32>(f.height)));
 
     amf::AMFVariant extradata;
-    if (enc->GetProperty(AMF_VIDEO_ENCODER_EXTRADATA, &extradata) == AMF_OK &&
+    if (enc->GetProperty(ExtraDataProperty(f.codec), &extradata) == AMF_OK &&
         extradata.type == amf::AMF_VARIANT_INTERFACE) {
         amf::AMFBufferPtr header(extradata.pInterface);
         if (header) {
@@ -211,10 +299,7 @@ void AmfEncoder::OutputLoop() {
         packet->duration =
             kOneSecond100ns * config_.format.fps_den / std::max(1u, config_.format.fps_num);
 
-        amf_int64 type = AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_P;
-        buffer->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type);
-        packet->keyframe = type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR ||
-                           type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_I;
+        packet->keyframe = IsKeyframe(buffer, config_.format.codec);
 
         ++stats_.frames_encoded;
         stats_.bytes_out += packet->size();
@@ -248,9 +333,22 @@ Status AmfEncoder::Submit(const CapturedFrame& frame) {
     surface->SetPts(static_cast<amf_pts>(frame.timestamp - epoch_));
     surface->SetDuration(static_cast<amf_pts>(kOneSecond100ns * config_.format.fps_den /
                                               std::max(1u, config_.format.fps_num)));
-    if (force_idr_.exchange(false))
-        surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
-                             AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR);
+    if (force_idr_.exchange(false)) {
+        switch (config_.format.codec) {
+            case Codec::HEVC:
+                surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE,
+                                     AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR);
+                break;
+            case Codec::AV1:
+                surface->SetProperty(AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE,
+                                     AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE_KEY);
+                break;
+            case Codec::H264:
+                surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
+                                     AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR);
+                break;
+        }
+    }
 
     ++stats_.frames_submitted;
 

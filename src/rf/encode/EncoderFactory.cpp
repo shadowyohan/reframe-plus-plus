@@ -96,6 +96,18 @@ bool HasHardwareEncoder(GpuVendor vendor, Codec codec) {
     return found;
 }
 
+bool CanDecode(Codec codec) {
+    MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Video, SubtypeFor(codec)};
+    IMFActivate** activates = nullptr;
+    UINT32 count = 0;
+    if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ALL, &in_info, nullptr, &activates,
+                         &count)))
+        return false;
+    for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
+    ::CoTaskMemFree(activates);
+    return count > 0;
+}
+
 Status PickEncodingDevice(const D3DDevicePtr& capture, Codec codec, D3DDevicePtr& out) {
     out = capture;
     if (!capture) return Status::Fail("null D3D device");

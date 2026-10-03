@@ -30,6 +30,7 @@ constexpr ImU32 kWarnAmberBg  = IM_COL32(0xff, 0xbd, 0x52, 77);
 constexpr ImU32 kAppAccent    = IM_COL32(0xa0, 0x99, 0xff, 255);
 constexpr ImU32 kAppAccentBg  = IM_COL32(0xa0, 0x99, 0xff, 26);
 constexpr ImU32 kScrim        = IM_COL32(0, 0, 0, 102);
+constexpr ImU32 kMomentFlag   = IM_COL32(0xff, 0xaa, 0x48, 255);
 
 constexpr float kScreenPad    = 25.0f;
 constexpr float kPanelW       = 438.0f;
@@ -91,6 +92,8 @@ enum class Font {
     Warning,
     WarningBold,
     Micro,
+    Label,
+    Button,
     Count
 };
 

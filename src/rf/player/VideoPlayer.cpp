@@ -158,15 +158,20 @@ void VideoPlayer::Close() {
     ready_.store(false, std::memory_order_release);
     file_.clear();
     width_ = height_ = 0;
-    srv_.Reset();
-    texture_.Reset();
+    retired_srv_ = std::move(srv_);
+    retired_texture_ = std::move(texture_);
+}
+
+void VideoPlayer::ReleaseRetiredFrame() {
+    retired_srv_.Reset();
+    retired_texture_.Reset();
 }
 
 void VideoPlayer::OnEngineEvent(std::uint32_t event) {
     switch (event) {
         case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
             size_known_.store(true, std::memory_order_release);
-            SelectEveryAudioStream();
+            SelectFirstAudioStream();
             break;
         case MF_MEDIA_ENGINE_EVENT_CANPLAY:
             ready_.store(true, std::memory_order_release);
@@ -188,18 +193,14 @@ void VideoPlayer::OnEngineEvent(std::uint32_t event) {
     }
 }
 
-void VideoPlayer::SelectEveryAudioStream() {
+void VideoPlayer::SelectFirstAudioStream() {
     ComPtr<IMFMediaEngineEx> ex;
     if (!engine_ || FAILED(engine_.As(&ex))) return;
-    if (FirstAudioTrackIsFullMix(file_)) {
-        RF_INFO("player: the first audio track already holds everything - playing only it");
-        return;
-    }
 
     DWORD count = 0;
     if (FAILED(ex->GetNumberOfStreams(&count)) || count == 0) return;
 
-    bool changed = false;
+    bool first_audio = true;
     for (DWORD i = 0; i < count; ++i) {
         PROPVARIANT type;
         ::PropVariantInit(&type);
@@ -208,14 +209,10 @@ void VideoPlayer::SelectEveryAudioStream() {
             type.vt == VT_CLSID && *type.puuid == MFMediaType_Audio;
         ::PropVariantClear(&type);
         if (!is_audio) continue;
-
-        BOOL selected = FALSE;
-        if (FAILED(ex->GetStreamSelection(i, &selected)) || selected) continue;
-        if (SUCCEEDED(ex->SetStreamSelection(i, TRUE))) changed = true;
+        ex->SetStreamSelection(i, first_audio);
+        first_audio = false;
     }
-
-    if (changed && SUCCEEDED(ex->ApplyStreamSelections()))
-        RF_INFO("player: all {} streams selected - every audio track will be heard", count);
+    ex->ApplyStreamSelections();
 }
 
 Status VideoPlayer::EnsureTexture() {

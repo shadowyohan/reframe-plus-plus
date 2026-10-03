@@ -16,9 +16,15 @@ public:
 
     enum class Result { Queued, RateLimited };
 
+    struct Moment {
+        Ticks100ns at = 0;
+        std::string tag;
+    };
+
     struct Due {
         std::uint32_t seconds = 0;
         std::vector<std::string> tags;
+        std::vector<Moment> moments;
     };
 
     Result Add(std::uint32_t pre_seconds, std::uint32_t post_seconds, std::string_view tag,
@@ -33,6 +39,7 @@ private:
         Ticks100ns start = 0;
         Ticks100ns deadline = 0;
         std::vector<std::string> tags;
+        std::vector<Moment> moments;
     };
 
     std::optional<Pending> pending_;

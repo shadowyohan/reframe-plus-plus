@@ -127,7 +127,8 @@ std::vector<DueClip> SdkHost::TakeDueClips(Ticks100ns now) {
     for (auto& [id, client] : clients_) {
         auto clip = client.clips.TakeDue(now, longest);
         if (!clip) continue;
-        due.push_back({id, client.pid, client.name, clip->seconds, std::move(clip->tags)});
+        due.push_back({id, client.pid, client.name, clip->seconds, std::move(clip->tags),
+                       std::move(clip->moments)});
     }
     return due;
 }

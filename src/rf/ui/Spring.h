@@ -33,6 +33,8 @@ inline constexpr SpringParams kSoft = SpringParams::FromFigma(11.1803f, 0.1581f,
 inline constexpr SpringParams kSavedThumb = SpringParams::FromFigma(7.4674f, 9.9565f, 0.79f);
 
 inline constexpr SpringParams kArmedSpin = SpringParams::FromFigma(7.3635f, 12.7540f, 0.9f);
+
+inline constexpr SpringParams kEditorRise = SpringParams::FromFigma(7.55f, 13.07f, 0.5f);
 }
 
 class Spring {

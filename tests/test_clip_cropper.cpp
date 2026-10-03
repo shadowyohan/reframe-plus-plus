@@ -5,9 +5,13 @@
 #include <mfreadwrite.h>
 #include <wrl/client.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <numeric>
+#include <string>
 #include <vector>
 
 #include "rf/mux/ClipCropper.h"
@@ -304,3 +308,139 @@ TEST(ClipCropper_HelperProcessCropsAndReplacesTheClip) {
 TEST(ClipCropper_CropsARealClipOnTheGpu) { CropSyntheticClip(true); }
 
 TEST(ClipCropper_CropsARealClipOnTheCpu) { CropSyntheticClip(false); }
+
+namespace {
+
+std::string Run(const std::string& command) {
+    std::string output;
+    if (std::FILE* pipe = _popen(command.c_str(), "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), pipe)) output += line;
+        _pclose(pipe);
+    }
+    return output;
+}
+
+double MediaFoundationDuration(const std::filesystem::path& file) {
+    ComPtr<IMFSourceReader> reader;
+    if (FAILED(::MFCreateSourceReaderFromURL(file.c_str(), nullptr, &reader))) return 0.0;
+    PROPVARIANT value;
+    ::PropVariantInit(&value);
+    double seconds = 0.0;
+    if (SUCCEEDED(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE),
+                                                   MF_PD_DURATION, &value)) &&
+        value.vt == VT_UI8)
+        seconds = static_cast<double>(value.uhVal.QuadPart) / 1e7;
+    ::PropVariantClear(&value);
+    return seconds;
+}
+
+double MaxVolume(const std::filesystem::path& file, int track) {
+    const std::string out = Run(std::format("ffmpeg -v info -i \"{}\" -map 0:a:{} -af volumedetect -f null - 2>&1",
+                                            file.string(), track));
+    const auto at = out.find("max_volume:");
+    return at == std::string::npos ? 0.0 : std::atof(out.c_str() + at + 11);
+}
+
+}
+
+TEST(ClipCropper_EditorTrimsDropsAndQuietensTracks) {
+    ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ::MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    const auto dir = std::filesystem::temp_directory_path() / "reframe-editor-test";
+    std::filesystem::create_directories(dir);
+    const auto source = dir / "clip.mp4";
+    const std::string make = std::format(
+        "ffmpeg -v error -y -f lavfi -i testsrc=duration=4:size=320x240:rate=30 "
+        "-f lavfi -i sine=frequency=440:duration=4 -f lavfi -i sine=frequency=880:duration=4 "
+        "-map 0 -map 1 -map 2 -c:v libx264 -g 30 -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2 \"{}\" 2>nul",
+        source.string());
+    if (std::system(make.c_str()) != 0 || !std::filesystem::exists(source)) {
+        SKIP("ffmpeg with libx264 is not installed");
+    } else {
+        CropJob job;
+        job.raw = source;
+        job.output = dir / "clip_edit.mp4";
+        job.frame_width = 320;
+        job.frame_height = 240;
+        job.bitrate_kbps = 2000;
+        job.trim_start = kOneSecond100ns;
+        job.trim_end = kOneSecond100ns * 3;
+        job.audio_edits = {{true, 0.5f}, {false, 1.0f}};
+        job.audio_names = {"Mix"};
+        job.keep_raw = true;
+
+        const Status edited = CropClip(job);
+        if (!edited.ok()) std::printf("    %s\n", edited.str().c_str());
+        CHECK(edited.ok());
+        CHECK(std::filesystem::exists(source));
+
+        const std::string streams =
+            Run(std::format("ffprobe -v error -show_entries stream=codec_type,duration -of csv=p=0 \"{}\"",
+                            job.output.string()));
+        CHECK(streams.find("audio") == streams.rfind("audio"));
+        const double duration =
+            std::atof(Run(std::format("ffprobe -v error -show_entries format=duration -of csv=p=0 \"{}\"",
+                                      job.output.string()))
+                          .c_str());
+        CHECK(duration > 1.8 && duration < 2.3);
+        const double player_duration = MediaFoundationDuration(job.output);
+        CHECK(player_duration > 1.8 && player_duration < 2.3);
+        const double quieter = MaxVolume(source, 0) - MaxVolume(job.output, 0);
+        CHECK(quieter > 5.0 && quieter < 7.0);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    ::MFShutdown();
+    ::CoUninitialize();
+}
+
+TEST(ClipCropper_EditorSpeedOnARealClip) {
+    char source_path[MAX_PATH] = {};
+    if (::GetEnvironmentVariableA("RF_EDIT_BENCH", source_path, sizeof(source_path)) == 0) {
+        SKIP("set RF_EDIT_BENCH=<clip.mp4> to time a real edit");
+        return;
+    }
+    ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ::MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    const auto dir = std::filesystem::temp_directory_path() / "reframe-editor-bench";
+    std::filesystem::create_directories(dir);
+
+    {
+        CropJob job;
+        job.raw = source_path;
+        job.output = dir / "audio.mp4";
+        job.frame_width = 1920;
+        job.frame_height = 1080;
+        job.audio_edits = {{true, 0.5f}};
+        job.keep_raw = true;
+        const auto started = ::GetTickCount64();
+        const Status edited = CropClip(job);
+        std::printf("    audio-only edit of the whole clip in %.1f s (%s)\n",
+                    (::GetTickCount64() - started) / 1000.0, edited.ok() ? "ok" : edited.str().c_str());
+    }
+
+    for (const bool gpu : {true, false}) {
+        CropJob job;
+        job.raw = source_path;
+        job.output = dir / (gpu ? "gpu.mp4" : "cpu.mp4");
+        job.frame_width = 1920;
+        job.frame_height = 1080;
+        job.bitrate_kbps = 15000;
+        job.trim_start = kOneSecond100ns * 5;
+        job.trim_end = kOneSecond100ns * 15;
+        job.keep_raw = true;
+        job.use_gpu = gpu;
+        const auto started = ::GetTickCount64();
+        const Status edited = CropClip(job);
+        std::printf("    %s: 10 s of 1080p in %.1f s (%s)\n", gpu ? "gpu" : "cpu",
+                    (::GetTickCount64() - started) / 1000.0, edited.ok() ? "ok" : edited.str().c_str());
+    }
+
+    char keep[8] = {};
+    if (::GetEnvironmentVariableA("RF_EDIT_BENCH_KEEP", keep, sizeof(keep)) > 0) return;
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    ::MFShutdown();
+    ::CoUninitialize();
+}

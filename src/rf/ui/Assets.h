@@ -52,6 +52,10 @@ public:
     ImTextureID FromRgba(const std::string& key, const std::uint8_t* pixels, int w, int h);
     [[nodiscard]] ImTextureID Find(const std::string& key) const;
     [[nodiscard]] bool Contains(const std::string& key) const { return Find(key) != ImTextureID{}; }
+    void Remove(const std::string& key) {
+        textures_.erase(key);
+        std::erase(order_, key);
+    }
 
 private:
 

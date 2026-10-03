@@ -7,12 +7,14 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <propvarutil.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <map>
 
 #include "rf/core/Log.h"
@@ -103,6 +105,54 @@ std::filesystem::path CurrentExecutable() {
     return path;
 }
 
+Status PcmLike(IMFMediaType* compressed, ComPtr<IMFMediaType>& pcm) {
+    const UINT32 channels = ::MFGetAttributeUINT32(compressed, MF_MT_AUDIO_NUM_CHANNELS, 2);
+    const UINT32 rate = ::MFGetAttributeUINT32(compressed, MF_MT_AUDIO_SAMPLES_PER_SECOND, 48'000);
+    RF_HR(::MFCreateMediaType(&pcm));
+    RF_HR(pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio));
+    RF_HR(pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM));
+    RF_HR(pcm->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels));
+    RF_HR(pcm->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate));
+    RF_HR(pcm->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16));
+    RF_HR(pcm->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, channels * 2));
+    RF_HR(pcm->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * channels * 2));
+    return Status::Ok();
+}
+
+Status FreshAac(IMFMediaType* source, ComPtr<IMFMediaType>& aac) {
+    constexpr UINT32 kAllowedBytesPerSecond[] = {12'000, 16'000, 20'000, 24'000};
+    const UINT32 wanted = ::MFGetAttributeUINT32(source, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24'000);
+    UINT32 bytes = kAllowedBytesPerSecond[0];
+    for (const UINT32 allowed : kAllowedBytesPerSecond)
+        if (allowed <= wanted) bytes = allowed;
+
+    ComPtr<IMFMediaType> fresh;
+    RF_HR(::MFCreateMediaType(&fresh));
+    RF_HR(fresh->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio));
+    RF_HR(fresh->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC));
+    RF_HR(fresh->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND,
+                           ::MFGetAttributeUINT32(source, MF_MT_AUDIO_SAMPLES_PER_SECOND, 48'000)));
+    RF_HR(fresh->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS,
+                           ::MFGetAttributeUINT32(source, MF_MT_AUDIO_NUM_CHANNELS, 2)));
+    RF_HR(fresh->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16));
+    RF_HR(fresh->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes));
+    aac = std::move(fresh);
+    return Status::Ok();
+}
+
+Status ApplyGain(IMFSample* sample, float gain) {
+    ComPtr<IMFMediaBuffer> buffer;
+    RF_HR(sample->ConvertToContiguousBuffer(&buffer));
+    BYTE* data = nullptr;
+    DWORD length = 0;
+    RF_HR(buffer->Lock(&data, nullptr, &length));
+    auto* samples = reinterpret_cast<std::int16_t*>(data);
+    for (DWORD i = 0; i < length / 2; ++i)
+        samples[i] = static_cast<std::int16_t>(std::clamp(samples[i] * gain, -32768.0f, 32767.0f));
+    buffer->Unlock();
+    return Status::Ok();
+}
+
 struct GpuDevice {
     ComPtr<ID3D11Device> device;
     ComPtr<IMFDXGIDeviceManager> manager;
@@ -129,10 +179,14 @@ struct Clip {
         DWORD source = 0;
         DWORD target = 0;
         ComPtr<IMFMediaType> type;
+        float gain = 1.0f;
+        bool decoded = false;
+        bool done = false;
     };
 
     DWORD video_index = MAXDWORD;
     DWORD video_stream = 0;
+    bool copy_video = false;
     std::vector<AudioStream> audio;
     UINT32 decoded_width = 0;
     UINT32 decoded_height = 0;
@@ -175,11 +229,13 @@ Status OpenClip(const CropJob& job, const std::filesystem::path& temp, IMFDXGIDe
 
     RF_HR(clip.reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));
     RF_HR(clip.reader->SetStreamSelection(clip.video_index, TRUE));
+    clip.copy_video = job.copies_video();
     ComPtr<IMFMediaType> nv12;
     RF_HR(::MFCreateMediaType(&nv12));
     RF_HR(nv12->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
     RF_HR(nv12->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12));
-    RF_HR(clip.reader->SetCurrentMediaType(clip.video_index, nullptr, nv12.Get()));
+    RF_HR(clip.reader->SetCurrentMediaType(clip.video_index, nullptr,
+                                           clip.copy_video ? native_video.Get() : nv12.Get()));
     ComPtr<IMFMediaType> decoded;
     RF_HR(clip.reader->GetCurrentMediaType(clip.video_index, &decoded));
     RF_HR(::MFGetAttributeSize(decoded.Get(), MF_MT_FRAME_SIZE, &clip.decoded_width,
@@ -187,15 +243,37 @@ Status OpenClip(const CropJob& job, const std::filesystem::path& temp, IMFDXGIDe
     clip.fallback_pitch =
         ::MFGetAttributeUINT32(decoded.Get(), MF_MT_DEFAULT_STRIDE, clip.decoded_width);
 
+    std::size_t audio_number = 0;
+    std::vector<ComPtr<IMFMediaType>> pcm_inputs;
     for (DWORD index = 0;; ++index) {
         Clip::AudioStream stream{index};
         if (FAILED(clip.reader->GetNativeMediaType(index, 0, &stream.type))) break;
         GUID major{};
         if (FAILED(stream.type->GetGUID(MF_MT_MAJOR_TYPE, &major)) || major != MFMediaType_Audio)
             continue;
+        const AudioEdit edit =
+            audio_number < job.audio_edits.size() ? job.audio_edits[audio_number] : AudioEdit{};
+        ++audio_number;
+        if (!edit.keep) continue;
+
+        ComPtr<IMFMediaType> read_as = stream.type;
+        if (edit.reencodes()) {
+            RF_TRY(PcmLike(stream.type.Get(), read_as));
+            RF_TRY(FreshAac(stream.type.Get(), stream.type));
+            stream.gain = edit.gain;
+            stream.decoded = true;
+        }
         if (SUCCEEDED(clip.reader->SetStreamSelection(index, TRUE)) &&
-            SUCCEEDED(clip.reader->SetCurrentMediaType(index, nullptr, stream.type.Get())))
+            SUCCEEDED(clip.reader->SetCurrentMediaType(index, nullptr, read_as.Get()))) {
+            pcm_inputs.push_back(read_as);
             clip.audio.push_back(std::move(stream));
+        }
+    }
+    if (job.trim_start > 0) {
+        PROPVARIANT position;
+        ::InitPropVariantFromInt64(job.trim_start, &position);
+        RF_HR(clip.reader->SetCurrentPosition(GUID_NULL, position));
+        ::PropVariantClear(&position);
     }
 
     clip.output = CropOutputSize(job.samples, job.frame_width, job.frame_height);
@@ -210,6 +288,8 @@ Status OpenClip(const CropJob& job, const std::filesystem::path& temp, IMFDXGIDe
     if (gpu) RF_HR(writer_attributes->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, gpu));
     RF_HR(::MFCreateSinkWriterFromURL(temp.c_str(), nullptr, writer_attributes.Get(), &clip.writer));
 
+    const GUID kCodecSubtypes[] = {MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_AV1};
+    if (job.codec >= 0 && job.codec < static_cast<int>(std::size(kCodecSubtypes))) codec = kCodecSubtypes[job.codec];
     ComPtr<IMFMediaType> encoded = VideoType(codec, out_width, out_height, clip.fps_num, clip.fps_den);
     clip.encoder_input =
         VideoType(MFVideoFormat_NV12, out_width, out_height, clip.fps_num, clip.fps_den);
@@ -223,12 +303,18 @@ Status OpenClip(const CropJob& job, const std::filesystem::path& temp, IMFDXGIDe
     RF_HR(encoded->SetUINT32(
         MF_MT_AVG_BITRATE,
         static_cast<UINT32>(kbps * 1000.0 * std::clamp(area_share, kMinBitrateShare, 1.0))));
-    RF_HR(clip.writer->AddStream(encoded.Get(), &clip.video_stream));
-    RF_HR(clip.writer->SetInputMediaType(clip.video_stream, clip.encoder_input.Get(), nullptr));
+    if (clip.copy_video) {
+        RF_HR(clip.writer->AddStream(native_video.Get(), &clip.video_stream));
+        RF_HR(clip.writer->SetInputMediaType(clip.video_stream, native_video.Get(), nullptr));
+    } else {
+        RF_HR(clip.writer->AddStream(encoded.Get(), &clip.video_stream));
+        RF_HR(clip.writer->SetInputMediaType(clip.video_stream, clip.encoder_input.Get(), nullptr));
+    }
 
-    for (Clip::AudioStream& stream : clip.audio) {
+    for (std::size_t i = 0; i < clip.audio.size(); ++i) {
+        Clip::AudioStream& stream = clip.audio[i];
         RF_HR(clip.writer->AddStream(stream.type.Get(), &stream.target));
-        RF_HR(clip.writer->SetInputMediaType(stream.target, stream.type.Get(), nullptr));
+        RF_HR(clip.writer->SetInputMediaType(stream.target, pcm_inputs[i].Get(), nullptr));
     }
     RF_HR(clip.writer->BeginWriting());
     RF_INFO("cropping {} to {}x{} on the {} with {}", job.raw.filename().string(), out_width,
@@ -237,35 +323,56 @@ Status OpenClip(const CropJob& job, const std::filesystem::path& temp, IMFDXGIDe
 }
 
 template <class FrameWriter>
-Status Pump(Clip& clip, const CropProgress& progress, FrameWriter&& write_frame) {
-    auto streams_open = 1 + clip.audio.size();
-    while (streams_open > 0) {
+Status Pump(Clip& clip, const CropJob& job, const CropProgress& progress, FrameWriter&& write_frame) {
+    const LONGLONG start = job.trim_start;
+    const LONGLONG end = job.trim_end > start ? job.trim_end : std::numeric_limits<LONGLONG>::max();
+    const LONGLONG span = (job.trim_end > start ? job.trim_end : clip.duration) - start;
+    bool video_done = false;
+
+    const auto finish_stream = [&](DWORD index, bool& done) {
+        if (done) return;
+        done = true;
+        clip.reader->SetStreamSelection(index, FALSE);
+    };
+
+    while (!video_done || std::any_of(clip.audio.begin(), clip.audio.end(),
+                                      [](const Clip::AudioStream& s) { return !s.done; })) {
         DWORD stream_index = 0, flags = 0;
         LONGLONG time = 0;
         ComPtr<IMFSample> sample;
         RF_HR(clip.reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_ANY_STREAM), 0,
                                       &stream_index, &flags, &time, &sample));
         if (flags & MF_SOURCE_READERF_ERROR) return Status::Fail("decoding the clip failed");
-        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-            --streams_open;
+
+        Clip::AudioStream* audio = nullptr;
+        for (Clip::AudioStream& stream : clip.audio)
+            if (stream.source == stream_index) audio = &stream;
+        bool& done = audio ? audio->done : video_done;
+
+        if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) || (sample && time >= end)) {
+            finish_stream(stream_index, done);
             continue;
         }
-        if (!sample) continue;
+        if (!sample || time < start) continue;
+        RF_HR(sample->SetSampleTime(time - start));
 
-        if (stream_index == clip.video_index) {
+        if (stream_index == clip.video_index && clip.copy_video) {
+            RF_HR(clip.writer->WriteSample(clip.video_stream, sample.Get()));
+            if (progress && span > 0)
+                progress(static_cast<float>(std::clamp(static_cast<double>(time - start) / span, 0.0, 1.0)));
+        } else if (stream_index == clip.video_index) {
             ComPtr<IMFSample> encoded;
             RF_TRY(write_frame(sample.Get(), time, encoded));
-            RF_HR(encoded->SetSampleTime(time));
+            RF_HR(encoded->SetSampleTime(time - start));
             LONGLONG duration = 0;
             if (SUCCEEDED(sample->GetSampleDuration(&duration)))
                 RF_HR(encoded->SetSampleDuration(duration));
             RF_HR(clip.writer->WriteSample(clip.video_stream, encoded.Get()));
-            if (progress && clip.duration > 0)
-                progress(static_cast<float>(std::clamp(static_cast<double>(time) / clip.duration, 0.0, 1.0)));
-        } else {
-            for (const Clip::AudioStream& stream : clip.audio)
-                if (stream.source == stream_index)
-                    RF_HR(clip.writer->WriteSample(stream.target, sample.Get()));
+            if (progress && span > 0)
+                progress(static_cast<float>(std::clamp(static_cast<double>(time - start) / span, 0.0, 1.0)));
+        } else if (audio) {
+            if (audio->decoded) RF_TRY(ApplyGain(sample.Get(), audio->gain));
+            RF_HR(clip.writer->WriteSample(audio->target, sample.Get()));
         }
     }
     RF_HR(clip.writer->Finalize());
@@ -279,6 +386,9 @@ public:
         gpu.device->GetImmediateContext(&context_);
         RF_HR(context_.As(&video_context_));
         RF_TRY(CreateBlackFrame(gpu.device.Get(), clip));
+        output_ = clip.output;
+        decoded_width_ = clip.decoded_width;
+        decoded_height_ = clip.decoded_height;
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
         content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -320,6 +430,16 @@ public:
 
     Status Frame(IMFSample* decoded, LONGLONG time, const CropJob& job, ComPtr<IMFSample>& out) {
         const FramePlan plan = PlanFrame(job.samples, time, job.frame_width, job.frame_height);
+
+        const bool whole_frame = !plan.black && plan.source.left == 0 && plan.source.top == 0 &&
+                                 plan.source.width() == output_.width() &&
+                                 plan.source.height() == output_.height() &&
+                                 decoded_width_ == static_cast<UINT32>(output_.width()) &&
+                                 decoded_height_ == static_cast<UINT32>(output_.height());
+        if (whole_frame) {
+            out = decoded;
+            return Status::Ok();
+        }
 
         RF_HR(allocator_->AllocateSample(&out));
         if (plan.black) {
@@ -419,6 +539,9 @@ private:
     ComPtr<ID3D11VideoDevice> video_device_;
     ComPtr<ID3D11VideoContext> video_context_;
     ComPtr<ID3D11Texture2D> black_;
+    PixelRect output_;
+    UINT32 decoded_width_ = 0;
+    UINT32 decoded_height_ = 0;
     ComPtr<ID3D11VideoProcessorEnumerator> enumerator_;
     ComPtr<ID3D11VideoProcessor> processor_;
     ComPtr<IMFVideoSampleAllocatorEx> allocator_;
@@ -436,7 +559,7 @@ Status TranscodeOnGpu(const CropJob& job, const std::filesystem::path& temp,
 
     GpuCropper cropper;
     RF_TRY(cropper.Init(gpu, clip));
-    return Pump(clip, progress, [&](IMFSample* decoded, LONGLONG time, ComPtr<IMFSample>& out) {
+    return Pump(clip, job, progress, [&](IMFSample* decoded, LONGLONG time, ComPtr<IMFSample>& out) {
         return cropper.Frame(decoded, time, job, out);
     });
 }
@@ -491,7 +614,7 @@ Status TranscodeOnCpu(const CropJob& job, const std::filesystem::path& temp,
 
     std::vector<std::uint8_t> frame(static_cast<std::size_t>(clip.output.width()) *
                                     clip.output.height() * 3 / 2);
-    return Pump(clip, progress, [&](IMFSample* decoded, LONGLONG time, ComPtr<IMFSample>& out) {
+    return Pump(clip, job, progress, [&](IMFSample* decoded, LONGLONG time, ComPtr<IMFSample>& out) {
         return CopyFrameOnCpu(decoded, time, job, clip, frame, out);
     });
 }
@@ -568,6 +691,13 @@ Status CropClip(const CropJob& job, const CropProgress& progress) {
     std::error_code ec;
     Status transcoded = job.use_gpu ? TranscodeOnGpu(job, temp, progress, has_audio)
                                     : Status::Fail("the GPU path is switched off");
+    if (!transcoded.ok() && job.codec > 0) {
+        RF_WARN("no hardware encoder for the chosen codec ({}) - using H.264", transcoded.str());
+        std::filesystem::remove(temp, ec);
+        CropJob h264 = job;
+        h264.codec = 0;
+        transcoded = job.use_gpu ? TranscodeOnGpu(h264, temp, progress, has_audio) : Status::Fail("cpu only");
+    }
     if (!transcoded.ok()) {
         if (job.use_gpu) RF_WARN("cropping on the GPU failed ({}) - using the CPU", transcoded.str());
         std::filesystem::remove(temp, ec);
@@ -581,7 +711,12 @@ Status CropClip(const CropJob& job, const CropProgress& progress) {
         std::filesystem::remove(temp, ec);
         return Status::Fail(HRESULT_FROM_WIN32(::GetLastError()), "replacing the clip");
     }
-    std::filesystem::remove(job.raw, ec);
+    if (!job.keep_raw && job.raw != job.output) std::filesystem::remove(job.raw, ec);
+
+    if (job.trim_start > 0 || job.trim_end > 0) {
+        if (auto s = RepairDurations(job.output); !s.ok())
+            RF_WARN("could not fix the length of {}: {}", job.output.string(), s.str());
+    }
 
     if (has_audio && !job.audio_names.empty()) {
         if (auto s = WriteAudioTrackNames(job.output, job.audio_names, job.first_track_is_full_mix);
@@ -603,6 +738,12 @@ Status WriteCropJob(const std::filesystem::path& file, const CropJob& job) {
     for (const WindowSample& s : job.samples)
         text += std::format("sample={} {} {} {} {} {}\n", s.at, s.visible ? 1 : 0, s.crop.left,
                             s.crop.top, s.crop.right, s.crop.bottom);
+    text += std::format("trim={} {}\n", job.trim_start, job.trim_end);
+    for (const AudioEdit& edit : job.audio_edits)
+        text += std::format("track={} {}\n", edit.keep ? 1 : 0, edit.gain);
+    text += std::format("keep_raw={}\n", job.keep_raw ? 1 : 0);
+    text += std::format("background={}\n", job.background ? 1 : 0);
+    text += std::format("codec={}\n", job.codec);
 
     std::FILE* out = _wfopen(file.c_str(), L"wb");
     if (!out) return Status::Fail("cannot write the crop job");
@@ -641,6 +782,23 @@ Status ReadCropJob(const std::filesystem::path& file, CropJob& job) {
             std::sscanf(value.c_str(), "%u %u", &job.frame_width, &job.frame_height);
         else if (key == "bitrate")
             std::sscanf(value.c_str(), "%u", &job.bitrate_kbps);
+        else if (key == "keep_raw") job.keep_raw = value == "1";
+        else if (key == "background") job.background = value == "1";
+        else if (key == "codec") std::sscanf(value.c_str(), "%d", &job.codec);
+        else if (key == "trim") {
+            long long start = 0, end = 0;
+            if (std::sscanf(value.c_str(), "%lld %lld", &start, &end) == 2) {
+                job.trim_start = start;
+                job.trim_end = end;
+            }
+        } else if (key == "track") {
+            int keep = 1;
+            AudioEdit edit;
+            if (std::sscanf(value.c_str(), "%d %f", &keep, &edit.gain) == 2) {
+                edit.keep = keep != 0;
+                job.audio_edits.push_back(edit);
+            }
+        }
         else if (key == "sample") {
             WindowSample s;
             long long at = 0;
@@ -702,7 +860,9 @@ Status CropInHelperProcess(const CropJob& job, const std::filesystem::path& help
     startup.hStdError = helper_output;
     PROCESS_INFORMATION process{};
     const BOOL started = ::CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, TRUE,
-                                          CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr,
+                                          CREATE_NO_WINDOW | (job.background ? BELOW_NORMAL_PRIORITY_CLASS
+                                                                             : NORMAL_PRIORITY_CLASS),
+                                          nullptr,
                                           nullptr, &startup, &process);
     const DWORD start_error = ::GetLastError();
     ::CloseHandle(helper_output);
@@ -743,10 +903,14 @@ Status CropInHelperProcess(const CropJob& job, const std::filesystem::path& help
 
 int RunCropHelper(const std::filesystem::path& job_file) {
     ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-    ::SetPriorityClass(::GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-    LowerProcessGpuPriority();
     ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(::MFStartup(MF_VERSION, MFSTARTUP_LITE))) return 2;
+    CropJob job;
+    const bool read = ReadCropJob(job_file, job).ok();
+    if (!read || job.background) {
+        ::SetPriorityClass(::GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        LowerProcessGpuPriority();
+    }
 
     HANDLE output = ::GetStdHandle(STD_OUTPUT_HANDLE);
     int reported = -1;
@@ -760,8 +924,7 @@ int RunCropHelper(const std::filesystem::path& job_file) {
         ::WriteFile(output, line, static_cast<DWORD>(length), &written, nullptr);
     };
 
-    CropJob job;
-    const bool cropped = ReadCropJob(job_file, job).ok() && CropClip(job, report).ok();
+    const bool cropped = read && CropClip(job, report).ok();
 
     ::MFShutdown();
     ::CoUninitialize();
@@ -813,7 +976,9 @@ void ClipCropper::Loop() {
         Status status = shutting_down ? Status::Fail("reframe++ is closing")
                                       : CropInHelperProcess(work.job, CurrentExecutable(),
                                                             work.progress);
-        if (!status.ok()) {
+        if (!status.ok() && work.job.keep_raw) {
+            RF_WARN("clip {} could not be saved: {}", work.job.output.string(), status.str());
+        } else if (!status.ok()) {
             RF_WARN("clip {} kept uncropped: {}", work.job.output.string(), status.str());
             ::MoveFileExW(work.job.raw.c_str(), work.job.output.c_str(),
                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);

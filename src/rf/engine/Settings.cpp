@@ -107,7 +107,8 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.height = GetU32(m, "height", s.height);
     s.bitrate_kbps = GetU32(m, "bitrate_kbps", s.bitrate_kbps);
     s.keyframe_interval_ms = GetU32(m, "keyframe_interval_ms", s.keyframe_interval_ms);
-    s.codec = static_cast<Codec>(GetU32(m, "codec", static_cast<std::uint32_t>(s.codec)));
+    s.codec = static_cast<Codec>(std::min(GetU32(m, "codec", static_cast<std::uint32_t>(s.codec)),
+                                          static_cast<std::uint32_t>(Codec::AV1)));
     s.capture_backend = static_cast<CaptureBackend>(
         GetU32(m, "capture_backend", static_cast<std::uint32_t>(s.capture_backend)));
     s.encoder_backend = static_cast<EncoderBackend>(
@@ -126,7 +127,15 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.app_clips_allowed = GetBool(m, "app_clips_allowed", s.app_clips_allowed);
     s.app_clips_crop_to_window = GetBool(m, "app_clips_crop_to_window", s.app_clips_crop_to_window);
     s.app_clips_app_audio_only = GetBool(m, "app_clips_app_audio_only", s.app_clips_app_audio_only);
-    s.hud_corner = std::min(GetU32(m, "hud_corner", s.hud_corner), 3u);
+    s.hud_corner = std::min(GetU32(m, "hud_corner", s.hud_corner), kHudCustomCorner);
+    s.record_corner = std::min(GetU32(m, "record_corner", s.record_corner), kHudCustomCorner);
+    const auto fraction = [&](const char* key) {
+        return std::clamp(static_cast<float>(GetU32(m, key, 0)) / 10000.0f, 0.0f, 1.0f);
+    };
+    s.badges_at_x = fraction("badges_at_x");
+    s.badges_at_y = fraction("badges_at_y");
+    s.record_at_x = fraction("record_at_x");
+    s.record_at_y = fraction("record_at_y");
     s.hud_badge_scale = std::clamp(static_cast<float>(GetU32(m, "hud_badge_scale_pct", 100)) / 100.0f,
                                    kHudBadgeScaleMin, kHudBadgeScaleMax);
     s.hud_opacity = std::clamp(static_cast<float>(GetU32(m, "hud_opacity_pct", 100)) / 100.0f,
@@ -164,6 +173,9 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.hotkey_toggle_record_vk = GetU32(m, "hotkey_toggle_record_vk", s.hotkey_toggle_record_vk);
     s.hotkey_toggle_record_mods =
         GetU32(m, "hotkey_toggle_record_mods", s.hotkey_toggle_record_mods);
+    s.hotkey_toggle_replay_vk = GetU32(m, "hotkey_toggle_replay_vk", s.hotkey_toggle_replay_vk);
+    s.hotkey_toggle_replay_mods =
+        GetU32(m, "hotkey_toggle_replay_mods", s.hotkey_toggle_replay_mods);
 
     if (const auto it = m.find("output_dir"); it != m.end() && !it->second.empty())
         s.output_dir = ToWide(it->second);
@@ -174,6 +186,11 @@ Settings Settings::Load(const std::filesystem::path& file) {
     s.monitor_follow_cursor = GetBool(m, "monitor_follow_cursor", s.monitor_follow_cursor);
     s.monitor_switch_delay_ms =
         std::min(GetU32(m, "monitor_switch_delay_ms", s.monitor_switch_delay_ms), 10'000u);
+    s.aspect_ratio = std::min<std::uint32_t>(GetU32(m, "aspect_ratio", s.aspect_ratio),
+                                             static_cast<std::uint32_t>(std::size(kAspectValues) - 1));
+    s.aspect_fill = std::min<std::uint32_t>(GetU32(m, "aspect_fill", s.aspect_fill), 1);
+    s.name_clips_by_app = GetBool(m, "name_clips_by_app", s.name_clips_by_app);
+    if (const auto it = m.find("gallery_filter"); it != m.end()) s.gallery_filter = it->second;
     s.ui_scale = std::clamp(static_cast<float>(GetU32(m, "ui_scale_pct", 100)) / 100.0f,
                             kUiScaleMin, kUiScaleMax);
     if (const auto it = m.find("filename_pattern"); it != m.end()) s.filename_pattern = it->second;
@@ -215,6 +232,12 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "app_clips_crop_to_window=" << (app_clips_crop_to_window ? 1 : 0) << "\n";
     out << "app_clips_app_audio_only=" << (app_clips_app_audio_only ? 1 : 0) << "\n";
     out << "hud_corner=" << hud_corner << "\n";
+    out << "record_corner=" << record_corner << "\n";
+    const auto permyriad = [](float value) { return static_cast<std::uint32_t>(value * 10000.0f + 0.5f); };
+    out << "badges_at_x=" << permyriad(badges_at_x) << "\n";
+    out << "badges_at_y=" << permyriad(badges_at_y) << "\n";
+    out << "record_at_x=" << permyriad(record_at_x) << "\n";
+    out << "record_at_y=" << permyriad(record_at_y) << "\n";
     out << "hud_badge_scale_pct=" << static_cast<int>(hud_badge_scale * 100.0f + 0.5f) << "\n";
     out << "hud_opacity_pct=" << static_cast<int>(hud_opacity * 100.0f + 0.5f) << "\n";
     out << "replay_in_memory=" << (replay_in_memory ? 1 : 0) << "\n";
@@ -238,6 +261,10 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "capture_monitor=" << capture_monitor << "\n";
     out << "monitor_follow_cursor=" << (monitor_follow_cursor ? 1 : 0) << "\n";
     out << "monitor_switch_delay_ms=" << monitor_switch_delay_ms << "\n";
+    out << "aspect_ratio=" << aspect_ratio << "\n";
+    out << "aspect_fill=" << aspect_fill << "\n";
+    out << "name_clips_by_app=" << (name_clips_by_app ? 1 : 0) << "\n";
+    out << "gallery_filter=" << gallery_filter << "\n";
     out << "ui_scale_pct=" << static_cast<std::uint32_t>(ui_scale * 100.0f + 0.5f) << "\n";
     out << "disk_limit_enabled=" << (disk_limit_enabled ? 1 : 0) << "\n";
     out << "disk_limit_gb=" << disk_limit_gb << "\n";
@@ -250,7 +277,31 @@ bool Settings::Save(const std::filesystem::path& file) const {
     out << "hotkey_save_replay_mods=" << hotkey_save_replay_mods << "\n";
     out << "hotkey_toggle_record_vk=" << hotkey_toggle_record_vk << "\n";
     out << "hotkey_toggle_record_mods=" << hotkey_toggle_record_mods << "\n";
+    out << "hotkey_toggle_replay_vk=" << hotkey_toggle_replay_vk << "\n";
+    out << "hotkey_toggle_replay_mods=" << hotkey_toggle_replay_mods << "\n";
     return true;
+}
+
+}
+
+namespace rf {
+
+double Settings::ForcedAspect() const {
+    return kAspectValues[std::min<std::size_t>(aspect_ratio, std::size(kAspectValues) - 1)];
+}
+
+std::pair<std::uint32_t, std::uint32_t> OutputSize(std::uint32_t source_width,
+                                                   std::uint32_t source_height,
+                                                   std::uint32_t target_height,
+                                                   double forced_aspect) {
+    if (source_width == 0 || source_height == 0) return {0, 0};
+    std::uint32_t height = source_height;
+    if (target_height != 0 && target_height < height) height = target_height;
+    const double aspect = forced_aspect > 0.0
+                              ? forced_aspect
+                              : static_cast<double>(source_width) / source_height;
+    auto width = static_cast<std::uint32_t>(height * aspect + 0.5);
+    return {width & ~1u, height & ~1u};
 }
 
 }

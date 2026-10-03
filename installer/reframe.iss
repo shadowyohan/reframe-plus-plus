@@ -11,7 +11,7 @@
 
 #define AppName        "reframe++"
 #ifndef AppVersion
-  #define AppVersion "2.1"
+  #define AppVersion "2.2"
 #endif
 #define AppPublisher   "shadowyohan"
 #define AppExe         "Reframe.exe"

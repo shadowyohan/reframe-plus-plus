@@ -1,12 +1,15 @@
 #pragma once
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "rf/engine/Recorder.h"
 #include "rf/engine/Settings.h"
 #include "rf/gallery/Gallery.h"
+#include "rf/player/TrackMixer.h"
 #include "rf/player/VideoPlayer.h"
+#include "rf/ui/Editor.h"
 #include "rf/ui/Widgets.h"
 
 namespace rf::ui {
@@ -71,6 +74,11 @@ struct AppModel {
     std::uint32_t pending_mods = 0;
 
     VideoPlayer* player = nullptr;
+    TrackMixer* mixer = nullptr;
+    std::vector<Codec> codecs{Codec::H264};
+    std::vector<Codec> playable_codecs{Codec::H264};
+    std::map<std::filesystem::path, float> replacing;
+    std::function<void(const ClipEdit&)> on_save_edit;
 };
 
 std::string DescribeHotkey(std::uint32_t mods, std::uint32_t vk);
@@ -83,6 +91,10 @@ public:
     void Close();
 
     void ToggleOpen();
+
+    void Escape(AppModel& model);
+
+    void SetForeignPanels(std::vector<ImVec4> panels) { foreign_panels_ = std::move(panels); }
 
     [[nodiscard]] bool open() const { return open_; }
 
@@ -97,9 +109,12 @@ public:
     [[nodiscard]] bool player_open() const { return player_open_; }
 
     [[nodiscard]] bool capturing_key() const { return capture_row_ >= 0; }
+    [[nodiscard]] bool editing_hud_layout() const { return hud_layout_; }
 
 private:
     void PlayerPanel(UiContext& ctx, ImVec2 screen, AppModel& model);
+    void CloseOnClickOutside(UiContext& ctx, AppModel& model);
+    void HudLayoutToolbar(UiContext& ctx, ImVec2 screen, AppModel& model);
 
     void Navigate(Page page, bool forward);
     void DrawPage(UiContext& ctx, Page page, ImVec2 panel_min, ImVec2 panel_max, AppModel& model,
@@ -140,6 +155,14 @@ private:
 
     int rejected_row_ = -1;
 
+    std::vector<ImVec4> panels_;
+    std::vector<ImVec4> foreign_panels_;
+    bool press_outside_ = false;
+
+    void OpenEditor(AppModel& model);
+
+    ClipEditor editor_;
+    bool hud_layout_ = false;
     bool player_open_ = false;
     Spring player_slide_{60.0f};
     float volume_ = 1.0f;

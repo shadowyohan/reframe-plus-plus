@@ -147,3 +147,27 @@ TEST(Settings_EveryFieldIsWrittenOut) {
     std::error_code ec;
     std::filesystem::remove(TempFile(), ec);
 }
+
+TEST(OutputSize_KeepsTheSourceShapeOnAuto) {
+    const auto [w, h] = rf::OutputSize(1280, 960, 0, 0.0);
+    CHECK_EQ(w, 1280u);
+    CHECK_EQ(h, 960u);
+}
+
+TEST(OutputSize_WidensAFourByThreeGameToSixteenByNine) {
+    const auto [w, h] = rf::OutputSize(1280, 960, 0, 16.0 / 9.0);
+    CHECK_EQ(w, 1706u);
+    CHECK_EQ(h, 960u);
+}
+
+TEST(OutputSize_DownscalesBeforeApplyingTheAspect) {
+    const auto [w, h] = rf::OutputSize(2560, 1440, 1080, 4.0 / 3.0);
+    CHECK_EQ(w, 1440u);
+    CHECK_EQ(h, 1080u);
+}
+
+TEST(OutputSize_StaysEven) {
+    const auto [w, h] = rf::OutputSize(1921, 1081, 0, 0.0);
+    CHECK_EQ(w % 2, 0u);
+    CHECK_EQ(h % 2, 0u);
+}

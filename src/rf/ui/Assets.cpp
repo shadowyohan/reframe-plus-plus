@@ -233,6 +233,8 @@ void FontSet::Load(ImGuiIO& io, const std::filesystem::path& dir, float dpi_scal
     fonts_[static_cast<int>(Font::Warning)] = add(embedded_regular, regular, 17.0f);
     fonts_[static_cast<int>(Font::WarningBold)] = add(embedded_wide_bold, wide_bold, 17.0f);
     fonts_[static_cast<int>(Font::Micro)] = add(embedded_italic, italic, 8.0f);
+    fonts_[static_cast<int>(Font::Label)] = add(embedded_wide, wide, 20.0f);
+    fonts_[static_cast<int>(Font::Button)] = add(embedded_wide, wide, 25.0f);
 
     io.Fonts->Build();
 }

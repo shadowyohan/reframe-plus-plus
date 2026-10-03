@@ -11,7 +11,7 @@ namespace rf {
 Status ColorConverter::Init(const D3DDevicePtr& device, std::uint32_t src_width,
                             std::uint32_t src_height, DXGI_FORMAT src_format,
                             std::uint32_t dst_width, std::uint32_t dst_height,
-                            DXGI_FORMAT dst_format, ColorSpace color) {
+                            DXGI_FORMAT dst_format, ColorSpace color, bool stretch) {
     device_ = device;
     src_width_ = src_width;
     src_height_ = src_height;
@@ -89,7 +89,7 @@ Status ColorConverter::Init(const D3DDevicePtr& device, std::uint32_t src_width,
 
     const double src_aspect = static_cast<double>(src_width_) / src_height_;
     const double dst_aspect = static_cast<double>(dst_width_) / dst_height_;
-    if (std::abs(src_aspect - dst_aspect) > 0.001) {
+    if (!stretch && std::abs(src_aspect - dst_aspect) > 0.001) {
         RECT fitted{0, 0, static_cast<LONG>(dst_width_), static_cast<LONG>(dst_height_)};
         if (src_aspect > dst_aspect) {
             const LONG height = static_cast<LONG>(dst_width_ / src_aspect + 0.5);

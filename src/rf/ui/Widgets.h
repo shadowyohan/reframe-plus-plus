@@ -1,8 +1,11 @@
 #pragma once
 #include <imgui.h>
 
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "rf/mux/TrackNames.h"
 #include "rf/ui/Assets.h"
 #include "rf/ui/Spring.h"
 #include "rf/ui/Theme.h"
@@ -117,5 +120,10 @@ private:
     float offset_ = 0.0f;
     std::uint32_t id_ = 0;
 };
+
+void DrawProgressRing(UiContext& ctx, ImVec2 center, float progress);
+
+std::optional<double> DrawMomentFlags(UiContext& ctx, const std::vector<ClipMarker>& markers,
+                                      ImVec2 bar_pos, float bar_w, float bar_h, double total_seconds);
 
 }

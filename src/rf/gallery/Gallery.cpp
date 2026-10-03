@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <format>
+#include <fstream>
 
 #include <wrl/client.h>
 
@@ -133,7 +134,47 @@ Status ExtractThumbnail(const std::filesystem::path& file, std::uint32_t max_edg
     return Status::Ok();
 }
 
+std::string AppFromFileName(std::string_view file_name) {
+    constexpr std::string_view kPrefix = "Reframe_";
+    if (!file_name.starts_with(kPrefix)) return {};
+    const std::string_view rest = file_name.substr(kPrefix.size());
+    const std::size_t end = rest.find('_');
+    if (end == std::string_view::npos || end == 0) return {};
+    const std::string_view label = rest.substr(0, end);
+    if (label == "Replay" || label == "Recording") return {};
+    return std::string(label);
+}
+
 Gallery::~Gallery() { Stop(); }
+
+void Gallery::LoadFavorites(const std::filesystem::path& file) {
+    std::scoped_lock lock(mutex_);
+    favorites_file_ = file;
+    favorites_.clear();
+    std::ifstream in(file, std::ios::binary);
+    for (std::string line; std::getline(in, line);) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (!line.empty()) favorites_.insert(line);
+    }
+    rescan_ = true;
+}
+
+void Gallery::SaveFavoritesLocked() const {
+    if (favorites_file_.empty()) return;
+    std::ofstream out(favorites_file_, std::ios::binary | std::ios::trunc);
+    for (const std::string& name : favorites_) out << name << "\n";
+    if (!out) RF_WARN("could not save the favourite clips to {}", favorites_file_.string());
+}
+
+void Gallery::ToggleFavorite(const std::filesystem::path& path) {
+    std::scoped_lock lock(mutex_);
+    const std::string name = ToUtf8(path.filename().wstring());
+    const bool now_favorite = favorites_.erase(name) == 0;
+    if (now_favorite) favorites_.insert(name);
+    for (auto& item : items_)
+        if (item.path == path) item.favorite = now_favorite;
+    SaveFavoritesLocked();
+}
 
 void Gallery::Start(const std::filesystem::path& dir) {
     if (running_) return;
@@ -189,6 +230,10 @@ void Gallery::Remove(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
     if (ec) RF_WARN("could not delete {}: {}", path.string(), ec.message());
+    {
+        std::scoped_lock lock(mutex_);
+        if (favorites_.erase(ToUtf8(path.filename().wstring())) > 0) SaveFavoritesLocked();
+    }
     rescan_ = true;
 }
 
@@ -217,6 +262,7 @@ void Gallery::Worker() {
                 item.sort_key = WriteTimeTicks(entry.path());
                 item.date_label = FormatDate(item.sort_key);
                 item.duration_label = "--:--";
+                item.app = AppFromFileName(item.display_name);
                 total += item.size_bytes;
                 found.push_back(std::move(item));
             }
@@ -228,7 +274,16 @@ void Gallery::Worker() {
 
             {
                 std::scoped_lock lock(mutex_);
+                if (!ec) {
+                    const auto missing = [&](const std::string& name) {
+                        return std::none_of(found.begin(), found.end(), [&](const GalleryItem& item) {
+                            return item.display_name == name;
+                        });
+                    };
+                    if (std::erase_if(favorites_, missing) > 0) SaveFavoritesLocked();
+                }
                 for (auto& item : found) {
+                    item.favorite = favorites_.contains(item.display_name);
                     for (const auto& old : items_) {
                         if (old.path != item.path) continue;
                         item.thumbnail = old.thumbnail;
@@ -238,6 +293,7 @@ void Gallery::Worker() {
                         item.thumb_uploaded = old.thumb_uploaded;
                         item.duration_label = old.duration_label;
                         item.duration_seconds = old.duration_seconds;
+                        item.markers = old.markers;
                         break;
                     }
                 }
@@ -267,11 +323,13 @@ void Gallery::Worker() {
         std::uint32_t w = 0, h = 0;
         double duration = 0.0;
         const Status s = ExtractThumbnail(pending, 256, pixels, w, h, duration);
+        std::vector<ClipMarker> markers = ReadClipMarkers(pending);
 
         std::scoped_lock lock(mutex_);
         for (auto& item : items_) {
             if (item.path != pending) continue;
             item.thumb_ready = true;
+            item.markers = std::move(markers);
             if (s.ok()) {
                 item.thumbnail = std::move(pixels);
                 item.thumb_width = w;

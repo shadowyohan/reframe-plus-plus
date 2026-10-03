@@ -16,7 +16,7 @@ class ColorConverter {
 public:
     Status Init(const D3DDevicePtr& device, std::uint32_t src_width, std::uint32_t src_height,
                 DXGI_FORMAT src_format, std::uint32_t dst_width, std::uint32_t dst_height,
-                DXGI_FORMAT dst_format, ColorSpace color);
+                DXGI_FORMAT dst_format, ColorSpace color, bool stretch = false);
 
     Status Convert(ID3D11Texture2D* src, ID3D11Texture2D** out);
 

@@ -28,6 +28,7 @@ public:
 
     Status Open(const std::filesystem::path& file);
     void Close();
+    void ReleaseRetiredFrame();
 
     void Play();
     void Pause();
@@ -53,7 +54,7 @@ public:
 private:
     friend class MediaEngineNotify;
 
-    void SelectEveryAudioStream();
+    void SelectFirstAudioStream();
     void OnEngineEvent(std::uint32_t event);
     Status EnsureTexture();
 
@@ -64,6 +65,8 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> retired_texture_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> retired_srv_;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
 

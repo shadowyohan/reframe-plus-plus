@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(ReframePlusPlus
-        VERSION 2.1.0
+        VERSION 2.2.0
         DESCRIPTION "Low-overhead GPU screen recorder with instant replay (NVIDIA + AMD + Intel)"
         LANGUAGES CXX C)
 
@@ -9,7 +9,7 @@ if(NOT WIN32)
     message(FATAL_ERROR "Reframe++ is a Windows-only project (D3D11 / DXGI / WGC / Media Foundation).")
 endif()
 
-set(RF_BUILD_NUMBER 1121)
+set(RF_BUILD_NUMBER 1200)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

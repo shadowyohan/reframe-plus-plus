@@ -42,10 +42,10 @@ SIZE PrimaryDisplayPixels() {
 }
 
 std::string FileNameSafe(std::string name) {
-    constexpr std::string_view kReserved = "<>:\"/\\|?*";
+    constexpr std::string_view kReserved = "<>:\"/\\|?*_";
     for (char& c : name)
         if (static_cast<unsigned char>(c) < 0x20 || kReserved.find(c) != std::string_view::npos)
-            c = '_';
+            c = '-';
     while (!name.empty() && (name.back() == '.' || name.back() == ' ')) name.pop_back();
     return name.empty() ? std::string("App") : name;
 }
@@ -111,6 +111,8 @@ Status Recorder::ApplySettings(const Settings& next) {
     const bool pipeline_differs =
         next.ResolvedFps() != settings_.ResolvedFps() ||
         next.ResolvedHeight() != settings_.ResolvedHeight() ||
+        next.aspect_ratio != settings_.aspect_ratio || next.aspect_fill != settings_.aspect_fill ||
+        next.monitor_follow_cursor != settings_.monitor_follow_cursor ||
         next.bitrate_kbps != settings_.bitrate_kbps || next.codec != settings_.codec ||
         next.keyframe_interval_ms != settings_.keyframe_interval_ms ||
         next.capture_focused_window_only != settings_.capture_focused_window_only ||
@@ -243,7 +245,7 @@ Status Recorder::BuildPipeline() {
 
     video_format_.width = capture_->width();
     video_format_.height = capture_->height();
-    if (target.kind == CaptureTarget::Kind::Display) {
+    if (target.kind == CaptureTarget::Kind::Display && settings_.monitor_follow_cursor) {
         if (const SIZE primary = PrimaryDisplayPixels(); primary.cx > 0 && primary.cy > 0) {
             video_format_.width = static_cast<std::uint32_t>(primary.cx);
             video_format_.height = static_cast<std::uint32_t>(primary.cy);
@@ -251,15 +253,9 @@ Status Recorder::BuildPipeline() {
         }
     }
 
-    if (const std::uint32_t target_height = settings_.ResolvedHeight();
-        target_height != 0 && target_height < video_format_.height) {
-        const double aspect = static_cast<double>(video_format_.width) / video_format_.height;
-        video_format_.height = target_height;
-        video_format_.width = static_cast<std::uint32_t>(target_height * aspect + 0.5);
-    }
-
-    video_format_.width &= ~1u;
-    video_format_.height &= ~1u;
+    std::tie(video_format_.width, video_format_.height) =
+        OutputSize(video_format_.width, video_format_.height, settings_.ResolvedHeight(),
+                   settings_.ForcedAspect());
     video_format_.fps_num = settings_.ResolvedFps();
     video_format_.fps_den = 1;
     video_format_.codec = settings_.codec;
@@ -274,8 +270,8 @@ Status Recorder::BuildPipeline() {
 
     cfg.quality_vs_speed = 66;
     cfg.quirks = quirks_;
-    cfg.input_width = capture_->width();
-    cfg.input_height = capture_->height();
+    cfg.input_width = video_format_.width;
+    cfg.input_height = video_format_.height;
 
     bridge_ready_ = false;
     bridge_misses_ = 0;
@@ -284,8 +280,6 @@ Status Recorder::BuildPipeline() {
                                   video_format_.height, DXGI_FORMAT_B8G8R8A8_UNORM);
             s.ok()) {
             bridge_ready_ = true;
-            cfg.input_width = video_format_.width;
-            cfg.input_height = video_format_.height;
         } else {
             RF_WARN("frames cannot be moved to the encoding GPU ({}) - encoding on the capture one",
                     s.str());
@@ -380,7 +374,6 @@ Status Recorder::BuildPipeline() {
                 !s.ok()) {
                 RF_WARN("microphone track unavailable ({}) - mixing instead", s.str());
                 aac_mic_.reset();
-    aac_system_.reset();
             }
         }
 
@@ -497,6 +490,7 @@ void Recorder::DisarmReplayLocked() {
     microphone_.reset();
     aac_.reset();
     aac_mic_.reset();
+    aac_system_.reset();
     {
         std::scoped_lock lock(mic_mutex_);
         mic_fifo_.clear();
@@ -898,7 +892,8 @@ void Recorder::OnFrame(const CapturedFrame& frame) {
             scaler_ = ColorConverter{};
             if (auto s = scaler_.Init(device_, frame.width, frame.height, frame.format,
                                       video_format_.width, video_format_.height,
-                                      DXGI_FORMAT_B8G8R8A8_UNORM, video_format_.color);
+                                      DXGI_FORMAT_B8G8R8A8_UNORM, video_format_.color,
+                                      settings_.StretchToAspect());
                 !s.ok()) {
                 RF_WARN("cannot scale this display into the recording: {}", s.str());
                 scaler_src_width_ = scaler_src_height_ = 0;
@@ -1129,6 +1124,12 @@ void Recorder::WriterLoop() {
     }
 }
 
+std::string Recorder::AppInFrameLocked(Ticks100ns from_pts, Ticks100ns to_pts) const {
+    if (settings_.capture_focused_window_only) return target_app();
+    if (!settings_.name_clips_by_app) return {};
+    return foreground_.Dominant(from_pts + epoch_, to_pts + epoch_);
+}
+
 std::filesystem::path Recorder::MakeOutputPath(std::string_view label,
                                                std::string_view tail) const {
     SYSTEMTIME now{};
@@ -1161,7 +1162,7 @@ Status Recorder::WriteClipLocked(const std::filesystem::path& path, Ticks100ns w
 }
 
 Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t seconds,
-                            bool release_saved) {
+                            bool release_saved, std::string* app_in_frame) {
 
     std::scoped_lock pipeline_lock(pipeline_mutex_);
     if (!settings_.replay_enabled) return Status::Fail("instant replay is disabled");
@@ -1172,8 +1173,11 @@ Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t secon
 
     if (replay_.GetStats().video_packets == 0) return Status::Fail("replay buffer is empty");
 
-    const auto path = MakeOutputPath("Replay");
-    const std::vector<std::uint32_t> kept = AudibleAudioTracks(replay_.ClipStart(window));
+    const Ticks100ns clip_start = replay_.ClipStart(window);
+    const std::string app = AppInFrameLocked(clip_start, Now100ns() - epoch_);
+    const auto path = MakeOutputPath(app.empty() ? std::string("Replay") : FileNameSafe(app));
+    if (app_in_frame) *app_in_frame = app;
+    const std::vector<std::uint32_t> kept = AudibleAudioTracks(clip_start);
 
     Ticks100ns covered_to = 0;
     RF_TRY(WriteClipLocked(path, window, aac_ ? aac_->output_type() : nullptr, AudioTrackCount(),
@@ -1196,7 +1200,8 @@ Status Recorder::SaveReplay(std::filesystem::path* saved_to, std::uint32_t secon
 }
 
 Status Recorder::SaveGameClip(const std::string& app, const std::string& tag,
-                              std::uint32_t seconds, GameClip& out) {
+                              std::uint32_t seconds, const std::vector<Moment>& moments,
+                              GameClip& out) {
     std::scoped_lock pipeline_lock(pipeline_mutex_);
     if (!settings_.replay_enabled) return Status::Fail("instant replay is disabled");
     if (replay_.GetStats().video_packets == 0) return Status::Fail("replay buffer is empty");
@@ -1211,6 +1216,7 @@ Status Recorder::SaveGameClip(const std::string& app, const std::string& tag,
     out.crop.frame_width = video_format_.width;
     out.crop.frame_height = video_format_.height;
     out.crop.bitrate_kbps = settings_.bitrate_kbps;
+    out.crop.codec = static_cast<int>(settings_.codec);
     out.needs_crop =
         settings_.app_clips_crop_to_window &&
         NeedsCropping(out.crop.samples, out.crop.frame_width, out.crop.frame_height);
@@ -1251,6 +1257,17 @@ Status Recorder::SaveGameClip(const std::string& app, const std::string& tag,
             RF_WARN("could not name the audio tracks of {}: {}", path.string(), s.str());
     }
 
+    out.markers.clear();
+    for (const Moment& moment : moments) {
+        const Ticks100ns offset = moment.at - (start + epoch_);
+        if (offset < 0 || offset > covered_to - start) continue;
+        out.markers.push_back({static_cast<std::uint32_t>(offset / 10'000), moment.tag});
+    }
+    if (!out.needs_crop && !out.markers.empty()) {
+        if (auto s = WriteClipMarkers(path, out.markers); !s.ok())
+            RF_WARN("could not mark the moments of {}: {}", path.string(), s.str());
+    }
+
     out.path = path;
     out.seconds =
         static_cast<std::uint32_t>((covered_to - start + kOneSecond100ns / 2) / kOneSecond100ns);
@@ -1287,6 +1304,23 @@ Status Recorder::StopRecording() {
     return StopRecordingLocked();
 }
 
+std::filesystem::path RenameForAppInFrame(const std::filesystem::path& file, const std::string& app) {
+    const std::wstring stem = file.stem().wstring();
+    constexpr std::wstring_view kGeneric = L"Reframe_Recording_";
+    if (app.empty() || !stem.starts_with(kGeneric)) return file;
+
+    std::filesystem::path renamed = file;
+    renamed.replace_filename(L"Reframe_" + ToWide(FileNameSafe(app)) + L"_" +
+                             stem.substr(kGeneric.size()) + file.extension().wstring());
+    std::error_code ec;
+    std::filesystem::rename(file, renamed, ec);
+    if (ec) {
+        RF_WARN("could not name the recording after {}: {}", app, ec.message());
+        return file;
+    }
+    return renamed;
+}
+
 Status Recorder::StopRecordingLocked() {
     if (state_ != State::Recording) return Status::Fail("not recording");
     state_ = State::ReplayArmed;
@@ -1299,6 +1333,7 @@ Status Recorder::StopRecordingLocked() {
     RF_TRY(muxer_->Close());
     std::filesystem::path file = muxer_->path();
     muxer_.reset();
+    file = RenameForAppInFrame(file, AppInFrameLocked(recording_from_, Now100ns() - epoch_));
 
     if (!aac_) return Status::Ok();
     std::vector<std::uint32_t> kept = AudibleAudioTracks(recording_from_);

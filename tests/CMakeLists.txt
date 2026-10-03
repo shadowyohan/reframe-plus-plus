@@ -9,6 +9,11 @@ add_executable(reframe-tests
     test_texture_cache.cpp
     test_noise_suppressor.cpp
     test_app_audio_tracks.cpp
+    test_audio_capture.cpp
+    test_foreground_tracker.cpp
+    test_gallery_names.cpp
+    test_track_mixer.cpp
+    test_codecs.cpp
     test_track_names.cpp
     test_cursor_painter.cpp
     test_integrations.cpp

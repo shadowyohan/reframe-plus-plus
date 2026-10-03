@@ -29,10 +29,33 @@ constexpr const wchar_t* kClassName = L"ReframeOverlay";
 
 constexpr int kNotFullscreenMargin = 1;
 
-SIZE OverlaySize() {
-    return {::GetSystemMetrics(SM_CXSCREEN),
-            ::GetSystemMetrics(SM_CYSCREEN) - kNotFullscreenMargin};
+bool IsPointerMove(UINT msg) {
+    return msg == WM_MOUSEMOVE || msg == WM_NCMOUSEMOVE || msg == WM_MOUSELEAVE ||
+           msg == WM_NCMOUSELEAVE;
 }
+
+void ScaleToPixels(ImDrawData* draw_data, float scale) {
+    if (!draw_data || scale == 1.0f) return;
+    for (ImDrawList* list : draw_data->CmdLists)
+        for (ImDrawVert& vertex : list->VtxBuffer) {
+            vertex.pos.x *= scale;
+            vertex.pos.y *= scale;
+        }
+    draw_data->ScaleClipRects(ImVec2(scale, scale));
+    draw_data->DisplaySize = ImVec2(draw_data->DisplaySize.x * scale, draw_data->DisplaySize.y * scale);
+}
+
+RECT MonitorBounds(HMONITOR monitor) {
+    MONITORINFO info{sizeof(info)};
+    if (!::GetMonitorInfoW(monitor, &info)) {
+        info.rcMonitor = {0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN)};
+    }
+    RECT bounds = info.rcMonitor;
+    bounds.bottom -= kNotFullscreenMargin;
+    return bounds;
+}
+
+HMONITOR PrimaryMonitor() { return ::MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY); }
 }
 
 Overlay::~Overlay() { Destroy(); }
@@ -49,7 +72,9 @@ LRESULT CALLBACK Overlay::WndProcThunk(HWND hwnd, UINT msg, WPARAM wparam, LPARA
 }
 
 LRESULT Overlay::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    if (imgui_ready_ && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) return 1;
+    if (imgui_ready_ && !IsPointerMove(msg) &&
+        ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam))
+        return 1;
 
     switch (msg) {
         case WM_SIZE:
@@ -59,6 +84,7 @@ LRESULT Overlay::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_DPICHANGED:
             dpi_scale_ = static_cast<float>(HIWORD(wparam)) / 96.0f;
             RF_INFO("overlay DPI changed to {:.2f}x", dpi_scale_);
+            ReloadAssets();
             return 0;
 
         case WM_NCHITTEST:
@@ -92,9 +118,9 @@ LRESULT Overlay::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_DISPLAYCHANGE:
 
         {
-            const SIZE size = OverlaySize();
-            Resize(static_cast<UINT>(size.cx), static_cast<UINT>(size.cy));
-            ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, size.cx, size.cy, SWP_NOACTIVATE);
+            const HMONITOR monitor = ::MonitorFromRect(&bounds_, MONITOR_DEFAULTTOPRIMARY);
+            monitor_ = nullptr;
+            FollowMonitor(monitor);
             return 0;
         }
 
@@ -158,14 +184,15 @@ Status Overlay::Create(const D3DDevicePtr& device, const std::filesystem::path& 
     wc.lpszClassName = kClassName;
     ::RegisterClassExW(&wc);
 
-    const SIZE size = OverlaySize();
-    width_ = static_cast<UINT>(size.cx);
-    height_ = static_cast<UINT>(size.cy);
+    monitor_ = PrimaryMonitor();
+    bounds_ = MonitorBounds(monitor_);
+    width_ = static_cast<UINT>(bounds_.right - bounds_.left);
+    height_ = static_cast<UINT>(bounds_.bottom - bounds_.top);
 
     const DWORD ex_style =
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE;
 
-    hwnd_ = ::CreateWindowExW(ex_style, kClassName, L"Reframe Overlay", WS_POPUP, 0, 0,
+    hwnd_ = ::CreateWindowExW(ex_style, kClassName, L"Reframe Overlay", WS_POPUP, bounds_.left, bounds_.top,
                               static_cast<int>(width_), static_cast<int>(height_), nullptr, nullptr,
                               instance_, this);
     if (!hwnd_) return Status::Fail(HRESULT_FROM_WIN32(::GetLastError()), "CreateWindowEx");
@@ -244,6 +271,7 @@ void Overlay::Resize(UINT width, UINT height) {
 
     width_ = width;
     height_ = height;
+    if (mirror_enabled_) SetMirrorToSharedSurface(false);
     ReleaseRenderTarget();
     swap_chain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
     if (auto s = CreateRenderTarget(); !s.ok()) RF_ERROR("overlay resize: {}", s.str());
@@ -311,6 +339,21 @@ void Overlay::SetVisible(bool visible) {
     ::ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
 
     if (visible) input_settle_ = 2;
+}
+
+void Overlay::FollowMonitor(HMONITOR monitor) {
+    if (!hwnd_ || !monitor || monitor == monitor_) return;
+    const RECT bounds = MonitorBounds(monitor);
+    monitor_ = monitor;
+    if (::EqualRect(&bounds, &bounds_) && width_ != 0) return;
+
+    bounds_ = bounds;
+    shape_.clear();
+    ::SetWindowRgn(hwnd_, nullptr, FALSE);
+    ::SetWindowPos(hwnd_, HWND_TOPMOST, bounds.left, bounds.top, bounds.right - bounds.left,
+                   bounds.bottom - bounds.top, SWP_NOACTIVATE);
+    RF_INFO("overlay moved to the display at {},{} {}x{}", bounds.left, bounds.top,
+            bounds.right - bounds.left, bounds.bottom - bounds.top);
 }
 
 void Overlay::SetClickable(bool clickable) {
@@ -388,7 +431,7 @@ UiContext* Overlay::BeginFrame() {
     ctx_.font_scale = 1.0f / ui_scale_;
     if (external_mouse_) {
 
-        ctx_.mouse = ImVec2(external_pos_.x / ui_scale_, external_pos_.y / ui_scale_);
+        ctx_.mouse = ExternalPosInLayout();
         ctx_.mouse_down = external_down_;
         ctx_.mouse_pressed = external_down_ && !external_down_prev_;
         ctx_.mouse_released = !external_down_ && external_down_prev_;
@@ -468,11 +511,16 @@ void Overlay::SetExternalMouse(bool active, ImVec2 pos, bool down, float wheel) 
     external_wheel_ += wheel;
 }
 
+ImVec2 Overlay::ExternalPosInLayout() const {
+    return ImVec2((external_pos_.x - static_cast<float>(bounds_.left)) / ui_scale_,
+                  (external_pos_.y - static_cast<float>(bounds_.top)) / ui_scale_);
+}
+
 void Overlay::EndFrame() {
     active_widget_ = ctx_.active_id;
 
     if (external_mouse_ && !SystemCursorVisible()) {
-        const ImVec2 p = ImVec2(external_pos_.x / ui_scale_, external_pos_.y / ui_scale_);
+        const ImVec2 p = ExternalPosInLayout();
         const float s = external_down_ ? 0.9f : 1.0f;
         const ImVec2 tip(p.x, p.y);
         const ImVec2 tail(p.x + 11.0f * s, p.y + 15.0f * s);
@@ -487,6 +535,7 @@ void Overlay::EndFrame() {
     }
 
     ImGui::Render();
+    ScaleToPixels(ImGui::GetDrawData(), ui_scale_);
 
     constexpr float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     ID3D11RenderTargetView* rtv = rtv_.Get();

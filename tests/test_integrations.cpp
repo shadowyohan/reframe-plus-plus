@@ -274,3 +274,17 @@ TEST(ControlServer_RoundTripOverAPipe) {
     CHECK(closed);
     server.Stop();
 }
+
+TEST(ClipScheduler_RemembersWhenEveryMomentHappened) {
+    rf::integrations::ClipScheduler scheduler;
+    constexpr rf::Ticks100ns kSecond = rf::kOneSecond100ns;
+    CHECK(scheduler.Add(5, 3, "kill", 10 * kSecond) == rf::integrations::ClipScheduler::Result::Queued);
+    CHECK(scheduler.Add(5, 3, "kill", 12 * kSecond) == rf::integrations::ClipScheduler::Result::Queued);
+    CHECK(scheduler.Add(5, 3, "ace", 13 * kSecond) == rf::integrations::ClipScheduler::Result::Queued);
+    const auto due = scheduler.TakeDue(17 * kSecond, 120);
+    CHECK(due.has_value());
+    CHECK_EQ(due->moments.size(), 3u);
+    CHECK(due->moments[1].at == 12 * kSecond);
+    CHECK(due->moments[2].tag == "ace");
+    CHECK_EQ(due->tags.size(), 2u);
+}

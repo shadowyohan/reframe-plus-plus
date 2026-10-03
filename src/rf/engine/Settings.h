@@ -1,4 +1,5 @@
 #pragma once
+#include <utility>
 #include <filesystem>
 #include <string>
 
@@ -41,6 +42,11 @@ struct Settings {
     bool show_mic_indicator = true;
     bool show_replay_indicator = true;
     std::uint32_t hud_corner = 3;
+    std::uint32_t record_corner = 0;
+    float badges_at_x = 0.0f;
+    float badges_at_y = 0.0f;
+    float record_at_x = 0.0f;
+    float record_at_y = 0.0f;
     float hud_badge_scale = 1.0f;
     float hud_opacity = 1.0f;
 
@@ -67,6 +73,10 @@ struct Settings {
 
     std::uint32_t quality = 2;
     std::uint32_t resolution = 0;
+    std::uint32_t aspect_ratio = 0;
+    std::uint32_t aspect_fill = 0;
+    bool name_clips_by_app = true;
+    std::string gallery_filter;
     std::uint32_t fps_option = 1;
 
     bool record_system_audio = true;
@@ -99,6 +109,8 @@ struct Settings {
     std::uint32_t hotkey_toggle_record_mods = 0x0001;
     std::uint32_t hotkey_overlay_vk = 0x5A;
     std::uint32_t hotkey_overlay_mods = 0x0001;
+    std::uint32_t hotkey_toggle_replay_vk = 0x79;
+    std::uint32_t hotkey_toggle_replay_mods = 0x0005;
 
     static Settings Defaults();
     static Settings Load(const std::filesystem::path& file);
@@ -106,6 +118,8 @@ struct Settings {
 
     [[nodiscard]] std::uint32_t ResolvedFps() const;
     [[nodiscard]] std::uint32_t ResolvedHeight() const;
+    [[nodiscard]] double ForcedAspect() const;
+    [[nodiscard]] bool StretchToAspect() const { return ForcedAspect() > 0.0 && aspect_fill == 0; }
 
     [[nodiscard]] static std::uint32_t BitrateForQuality(std::uint32_t quality);
 
@@ -128,6 +142,17 @@ inline constexpr std::uint32_t kBitrateMaxKbps = 30'000;
 inline constexpr const char* kResolutionNames[] = {"Экран", "720p HD", "1080p HD", "1440p QHD",
                                                    "2160p 4K"};
 inline constexpr std::uint32_t kResolutionHeights[] = {0, 720, 1080, 1440, 2160};
+inline constexpr const char* kAspectNames[] = {"Авто", "16:9", "16:10", "4:3", "21:9"};
+inline constexpr double kAspectValues[] = {0.0, 16.0 / 9.0, 16.0 / 10.0, 4.0 / 3.0, 21.0 / 9.0};
+inline constexpr const char* kAspectFillNames[] = {"Растянуть", "Полосы"};
+
+[[nodiscard]] std::pair<std::uint32_t, std::uint32_t> OutputSize(std::uint32_t source_width,
+                                                                 std::uint32_t source_height,
+                                                                 std::uint32_t target_height,
+                                                                 double forced_aspect);
+
+inline constexpr const char* kCodecNames[] = {"H.264", "H.265", "AV1"};
+
 inline constexpr const char* kFpsNames[] = {"30 FPS", "60 FPS", "120 FPS", "144 FPS"};
 inline constexpr std::uint32_t kFpsValues[] = {30, 60, 120, 144};
 inline constexpr const char* kAudioTrackNames[] = {"Одна дорожка", "Раздельно",
@@ -139,7 +164,8 @@ inline constexpr std::uint32_t kAppTrackSlotsMax = 20;
 inline constexpr const char* kNoiseSuppressionNames[] = {"RNNoise", "Speex", "NVIDIA Maxine"};
 
 inline constexpr const char* kHudCornerNames[] = {"Слева сверху", "Справа сверху", "Слева снизу",
-                                                  "Справа снизу"};
+                                                  "Справа снизу", "Своё"};
+inline constexpr std::uint32_t kHudCustomCorner = 4;
 
 inline constexpr float kHudBadgeScaleMin = 0.6f;
 inline constexpr float kHudBadgeScaleMax = 2.0f;

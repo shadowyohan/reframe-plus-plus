@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <map>
+#include <optional>
 
 #include "rf/core/Log.h"
 #include "rf/core/Strings.h"
@@ -161,6 +163,8 @@ void Menu::Open() {
 
 void Menu::Close() {
     open_ = false;
+    hud_layout_ = false;
+    editor_.Close();
 
     ClosePlayer();
 
@@ -172,6 +176,44 @@ void Menu::ToggleOpen() {
         Close();
     else
         Open();
+}
+
+namespace {
+constexpr float kStarSize = 22.0f;
+constexpr ImU32 kFavoriteStar = IM_COL32(255, 204, 77, 255);
+
+const GalleryItem* FindItem(const AppModel& model, const std::filesystem::path& file) {
+    const auto it = std::find_if(model.gallery_items.begin(), model.gallery_items.end(),
+                                 [&](const GalleryItem& item) { return item.path == file; });
+    return it == model.gallery_items.end() ? nullptr : &*it;
+}
+
+}
+
+void Menu::Escape(AppModel& model) {
+    if (capturing_key()) return;
+    if (hud_layout_)
+        hud_layout_ = false;
+    else if (editor_.open())
+        editor_.Escape();
+    else if (player_open_)
+        ClosePlayer(model);
+    else if (open_)
+        Close();
+}
+
+void Menu::CloseOnClickOutside(UiContext& ctx, AppModel& model) {
+    if (!open_ || !ctx.interactive) return;
+    const auto inside = [&](const ImVec4& r) {
+        return ctx.mouse.x >= r.x && ctx.mouse.x <= r.z && ctx.mouse.y >= r.y && ctx.mouse.y <= r.w;
+    };
+    const auto outside = [&] {
+        return std::none_of(panels_.begin(), panels_.end(), inside) &&
+               std::none_of(foreign_panels_.begin(), foreign_panels_.end(), inside);
+    };
+    if (ctx.mouse_pressed) press_outside_ = outside();
+    if (ctx.mouse_released && press_outside_ && outside()) Escape(model);
+    if (ctx.mouse_released) press_outside_ = false;
 }
 
 bool Menu::visible() const { return open_ || slide_.value() > -595.0f; }
@@ -190,6 +232,7 @@ void Menu::Navigate(Page page, bool forward) {
 }
 
 void Menu::Draw(UiContext& ctx, ImVec2 screen, AppModel& model, TextureCache& textures) {
+    if (model.player) model.player->ReleaseRetiredFrame();
     const float x = slide_.Update(ctx.dt, open_ ? spring::kMenu : spring::kExit);
     if (!open_ && x <= -595.0f) {
 
@@ -201,6 +244,13 @@ void Menu::Draw(UiContext& ctx, ImVec2 screen, AppModel& model, TextureCache& te
         monitor_list_open_ = false;
         capture_row_ = -1;
         rejected_row_ = -1;
+        return;
+    }
+
+    if (hud_layout_) {
+        panels_.clear();
+        HudLayoutToolbar(ctx, screen, model);
+        CloseOnClickOutside(ctx, model);
         return;
     }
 
@@ -245,6 +295,10 @@ void Menu::Draw(UiContext& ctx, ImVec2 screen, AppModel& model, TextureCache& te
     const ImVec2 panel_max(col_x + kPanelW, screen.y - kScreenPad);
     DrawPanel(ctx, panel_min, panel_max, kPanelRadius);
 
+    panels_.clear();
+    panels_.emplace_back(col_x, header_y, pill_x + pill_w, header_y + kLogoBox);
+    panels_.emplace_back(panel_min.x, panel_min.y, panel_max.x, panel_max.y);
+
     ctx.dl->PushClipRect(ctx.At(ImVec2(panel_min.x + 1, panel_min.y + 1)),
                          ctx.At(ImVec2(panel_max.x - 1, panel_max.y - 1)), true);
 
@@ -278,10 +332,73 @@ void Menu::Draw(UiContext& ctx, ImVec2 screen, AppModel& model, TextureCache& te
     ctx.dl->PopClipRect();
     ctx.offset = ImVec2(0, 0);
 
-    PlayerPanel(ctx, screen, model);
+    if (!editor_.covering()) {
+        const bool was_interactive = ctx.interactive;
+        if (editor_.open()) ctx.interactive = false;
+        PlayerPanel(ctx, screen, model);
+        ctx.interactive = was_interactive;
+    }
+    if (editor_.visible()) {
+        if (editor_.open()) panels_.clear();
+        editor_.Draw(ctx, screen, panels_);
+    }
+    CloseOnClickOutside(ctx, model);
+}
+
+void Menu::HudLayoutToolbar(UiContext& ctx, ImVec2 screen, AppModel& model) {
+    constexpr float kW = 560.0f, kH = 74.0f, kButtonW = 150.0f, kButtonH = 42.0f;
+    const ImVec2 min((screen.x - kW) * 0.5f, screen.y - kScreenPad - kH - 60.0f);
+    const ImVec2 max(min.x + kW, min.y + kH);
+    panels_.emplace_back(min.x, min.y, max.x, max.y);
+    DrawPanel(ctx, min, max, 24.0f);
+    DrawText(ctx, Font::Body, ImVec2(min.x + 20.0f, min.y + 24.0f), kText, "Перетащите индикаторы");
+
+    const auto button = [&](const char* id, const char* label, float x, ImU32 bg, ImU32 fg) {
+        const ImVec2 bmin(x, min.y + (kH - kButtonH) * 0.5f);
+        const Interaction it = Hit(ctx, HashId(id), bmin, ImVec2(bmin.x + kButtonW, bmin.y + kButtonH));
+        ctx.dl->AddRectFilled(ctx.At(bmin), ctx.At(ImVec2(bmin.x + kButtonW, bmin.y + kButtonH)),
+                              ctx.Fade(bg), 14.0f + 2.0f * it.hover);
+        const ImVec2 size = MeasureText(ctx, Font::Body, label);
+        DrawText(ctx, Font::Body,
+                 ImVec2(bmin.x + (kButtonW - size.x) * 0.5f, bmin.y + (kButtonH - size.y) * 0.5f), fg, label);
+        return it.clicked;
+    };
+
+    Settings& s = *model.settings;
+    if (button("hud-layout-reset", Tr("Сбросить"), max.x - 2 * kButtonW - 30.0f, kRowBg, kText)) {
+        s.hud_corner = 3;
+        s.record_corner = 0;
+        if (model.on_settings_changed) model.on_settings_changed();
+    }
+    if (button("hud-layout-done", Tr("Готово"), max.x - kButtonW - 20.0f, IM_COL32(0x9e, 0xff, 0x96, 51),
+               kAccent))
+        hud_layout_ = false;
+}
+
+void Menu::OpenEditor(AppModel& model) {
+    if (!model.player) return;
+    const std::filesystem::path file = model.player->file();
+    const GalleryItem* item = FindItem(model, file);
+    ClipEditor::Hooks hooks;
+    hooks.player = model.player;
+    hooks.mixer = model.mixer;
+    hooks.player_volume = volume_;
+    hooks.is_favorite = [&model, file] {
+        const GalleryItem* shown = FindItem(model, file);
+        return shown && shown->favorite;
+    };
+    hooks.on_toggle_favorite = [&model, file] {
+        if (model.gallery) model.gallery->ToggleFavorite(file);
+    };
+    hooks.on_save = [this, &model](const ClipEdit& edit) {
+        ClosePlayer(model);
+        if (model.on_save_edit) model.on_save_edit(edit);
+    };
+    editor_.Open(std::move(hooks), file, item ? item->markers : std::vector<ClipMarker>{});
 }
 
 void Menu::OpenInPlayer(AppModel& model, const std::filesystem::path& file) {
+    if (model.replacing.contains(file)) return;
 
     if (!model.player) {
         if (model.on_open_file) model.on_open_file(file);
@@ -326,6 +443,7 @@ void Menu::PlayerPanel(UiContext& ctx, ImVec2 screen, AppModel& model) {
     ctx.alpha = std::clamp(1.0f - slide / 60.0f, 0.0f, 1.0f);
 
     DrawPanel(ctx, panel_min, panel_max, kPanelRadius);
+    panels_.emplace_back(panel_min.x, panel_min.y, panel_max.x, panel_max.y);
 
     constexpr float kPad = 20.0f, kGap = 30.0f;
     const float content_x = panel_min.x + kPad;
@@ -350,6 +468,16 @@ void Menu::PlayerPanel(UiContext& ctx, ImVec2 screen, AppModel& model) {
         Interaction close = Hit(ctx, HashId("player-close"), close_pos,
                                 ImVec2(close_pos.x + 50.0f, close_pos.y + 50.0f));
         DrawIcon(ctx, "close", close_pos, 50.0f, kText, 1.0f + 0.12f * close.hover - 0.1f * close.press);
+        const GalleryItem* shown = FindItem(model, player.file());
+        if (shown && model.gallery) {
+            const ImVec2 star_pos(close_pos.x - 50.0f, y + 9.0f);
+            const Interaction star = Hit(ctx, HashId("player-star"), star_pos,
+                                         ImVec2(star_pos.x + 32.0f, star_pos.y + 32.0f));
+            DrawIcon(ctx, "star", star_pos, 32.0f,
+                     shown->favorite ? kFavoriteStar : IM_COL32(255, 255, 255, 90),
+                     1.0f + 0.12f * star.hover - 0.1f * star.press);
+            if (star.clicked) model.gallery->ToggleFavorite(shown->path);
+        }
         if (close.clicked) {
             ClosePlayer(model);
             ctx.offset = ImVec2(0, 0);
@@ -413,8 +541,8 @@ void Menu::PlayerPanel(UiContext& ctx, ImVec2 screen, AppModel& model) {
                                              static_cast<int>(player.duration()) % 60);
         const float time_w = MeasureText(ctx, Font::Body, time.c_str()).x;
         constexpr float kVolSlider = 155.0f;
-        const float right_w = time_w + kCtlGap + kBtn + 10.0f + kVolSlider + 40.0f + 2 * kBtn +
-                              10.0f;
+        const float right_w = time_w + kCtlGap + kBtn + 10.0f + kVolSlider + 40.0f + 3 * kBtn +
+                              20.0f;
         const float seek_w = std::max(80.0f, content_x + content_w - x - kCtlGap - right_w);
 
         {
@@ -423,6 +551,11 @@ void Menu::PlayerPanel(UiContext& ctx, ImVec2 screen, AppModel& model) {
             if (SliderBar(ctx, HashId("player-seek"), ImVec2(x, center_y - 13.0f), seek_w, 26.0f,
                           pos, 0.0f, total))
                 player.Seek(pos);
+            if (const GalleryItem* item = FindItem(model, player.file())) {
+                if (const auto moment = DrawMomentFlags(ctx, item->markers, ImVec2(x, center_y - 13.0f),
+                                                        seek_w, 26.0f, total))
+                    player.Seek(static_cast<float>(*moment));
+            }
             x += seek_w + kCtlGap;
         }
 
@@ -451,7 +584,17 @@ void Menu::PlayerPanel(UiContext& ctx, ImVec2 screen, AppModel& model) {
         }
 
         {
-            float rx = content_x + content_w - 2 * kBtn - 10.0f;
+            float rx = content_x + content_w - 3 * kBtn - 20.0f;
+            Interaction edit = Hit(ctx, HashId("player-edit"), ImVec2(rx, row_y),
+                                   ImVec2(rx + kBtn, row_y + kBtn));
+            DrawIcon(ctx, "edit", ImVec2(rx, row_y), kBtn, kText, 1.0f + 0.1f * edit.hover);
+            if (edit.clicked) {
+                OpenEditor(model);
+                ctx.offset = ImVec2(0, 0);
+                ctx.alpha = 1.0f;
+                return;
+            }
+            rx += kBtn + 10.0f;
             Interaction folder = Hit(ctx, HashId("player-folder"), ImVec2(rx, row_y),
                                      ImVec2(rx + kBtn, row_y + kBtn));
             DrawIcon(ctx, "folder", ImVec2(rx, row_y), kBtn, kText, 1.0f + 0.1f * folder.hover);
@@ -739,6 +882,17 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
         }
     }
 
+    if (!s.capture_focused_window_only) {
+        const ImVec2 pos = col.Next(kRowH_TwoLine);
+        Interaction row = Row(ctx, HashId("v-app-name"), pos, ImVec2(col.w, kRowH_TwoLine));
+        RowIcon(ctx, row, pos, "monitor-recorder");
+        RowTitle(ctx, pos, "Приложение в кадре");
+        RowSubtitle(ctx, pos, "Называть откат по приложению", 41.0f);
+        if (Toggle(ctx, HashId("v-app-name-t"), ImVec2(pos.x + col.w - 95.0f, pos.y + 13.0f),
+                   s.name_clips_by_app))
+            dirty = true;
+    }
+
     {
         const ImVec2 pos = col.Next(kRowH_Slider);
         Interaction row = Row(ctx, HashId("v-replay"), pos, ImVec2(col.w, kRowH_Slider));
@@ -989,19 +1143,27 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
          static_cast<int>(kQualityCustom)},
         {"v-res", "monitor", "Разрешение", &s.resolution, kResolutionNames,
          static_cast<int>(std::size(kResolutionNames))},
+        {"v-aspect", "monitor-recorder", "Соотношение сторон", &s.aspect_ratio, kAspectNames,
+         static_cast<int>(std::size(kAspectNames))},
+        {"v-fill", "video-circle", "Заполнение", &s.aspect_fill, kAspectFillNames,
+         static_cast<int>(std::size(kAspectFillNames))},
         {"v-fps", "video", "Частота кадров", &s.fps_option, kFpsNames,
          static_cast<int>(std::size(kFpsNames))},
     };
 
     for (const StepperRow& row_def : kSteppers) {
+        if (row_def.value == &s.aspect_fill && s.ForcedAspect() <= 0.0) continue;
         const ImVec2 pos = col.Next(kRowH_Simple);
         Interaction row = Row(ctx, HashId(row_def.id), pos, ImVec2(col.w, kRowH_Simple));
         DrawIcon(ctx, row_def.icon, ImVec2(pos.x + kRowIconX, pos.y + 16.0f), kRowIcon, kText,
                  1.0f + 0.10f * row.hover);
         DrawText(ctx, Font::Body, ImVec2(pos.x + kRowTextX, pos.y + 15.0f), kText, row_def.title);
 
+        const bool is_quality = row_def.value == &s.quality;
         const auto current = std::min<std::uint32_t>(
-            *row_def.value, static_cast<std::uint32_t>(std::size(kQualityNames) - 1));
+            *row_def.value, static_cast<std::uint32_t>(
+                                (is_quality ? static_cast<int>(std::size(kQualityNames))
+                                            : row_def.count) - 1));
         int index = (row_def.value == &s.quality) ? static_cast<int>(current)
                                                   : static_cast<int>(current) % row_def.count;
         const char* label = (row_def.value == &s.quality) ? kQualityNames[index]
@@ -1018,6 +1180,37 @@ void Menu::PageVideo(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 p
             }
             dirty = true;
         }
+    }
+
+    if (model.codecs.size() > 1) {
+        const ImVec2 pos = col.Next(kRowH_Simple);
+        Interaction row = Row(ctx, HashId("v-codec"), pos, ImVec2(col.w, kRowH_Simple));
+        DrawIcon(ctx, "video-circle", ImVec2(pos.x + kRowIconX, pos.y + 16.0f), kRowIcon, kText,
+                 1.0f + 0.10f * row.hover);
+        DrawText(ctx, Font::Body, ImVec2(pos.x + kRowTextX, pos.y + 15.0f), kText, "Кодек");
+
+        const auto chosen = std::find(model.codecs.begin(), model.codecs.end(), s.codec);
+        int index = chosen == model.codecs.end() ? 0 : static_cast<int>(chosen - model.codecs.begin());
+        if (Stepper(ctx, HashId("v-codec-s"), pos, col.w, pos.y + kRowH_Simple * 0.5f, index,
+                    static_cast<int>(model.codecs.size()),
+                    kCodecNames[static_cast<int>(model.codecs[index])])) {
+            s.codec = model.codecs[index];
+            dirty = true;
+        }
+
+        const bool playable = std::find(model.playable_codecs.begin(), model.playable_codecs.end(),
+                                        s.codec) != model.playable_codecs.end();
+        if (s.codec == Codec::HEVC && !playable)
+            col.Skip(WarningRow(ctx, col.Peek(), col.w, kWarnAmber, kWarnAmberBg,
+                                "Чтобы смотреть клипы в reframe++, установите \"HEVC Video Extensions\" "
+                                "из Microsoft Store"));
+        else if (s.codec == Codec::AV1 && !playable)
+            col.Skip(WarningRow(ctx, col.Peek(), col.w, kWarnAmber, kWarnAmberBg,
+                                "Чтобы смотреть клипы в reframe++, установите \"AV1 Video Extension\" "
+                                "из Microsoft Store"));
+        else if (s.codec != Codec::H264)
+            col.Skip(WarningRow(ctx, col.Peek(), col.w, kWarnAmber, kWarnAmberBg,
+                                "Не все редакторы и мессенджеры открывают этот кодек"));
     }
 
     {
@@ -1393,7 +1586,7 @@ void Menu::PageInterface(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVe
         toggle_row("i-stop", "close", "Кнопка остановки", "Рядом с индикатором записи",
                    s.show_stop_button);
 
-    DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "значки");
+    DrawText(ctx, Font::H2, col.Next(kH2Height), kText, "индикаторы");
 
     toggle_row("i-mic", "microphone", "Индикатор микрофона", "Значок в углу экрана",
                s.show_mic_indicator);
@@ -1401,26 +1594,36 @@ void Menu::PageInterface(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVe
                s.show_replay_indicator);
 
     const bool badges = s.show_mic_indicator || s.show_replay_indicator;
+    const bool any_indicator = badges || s.show_record_indicator;
 
-    if (badges) {
+    const auto corner_row = [&](const char* id, const char* title, std::uint32_t& corner) {
         const ImVec2 pos = col.Next(kRowH_Simple);
-        Interaction row = Row(ctx, HashId("i-corner"), pos, ImVec2(col.w, kRowH_Simple));
+        Interaction row = Row(ctx, HashId(id), pos, ImVec2(col.w, kRowH_Simple));
         RowIcon(ctx, row, pos, "monitor-recorder", kRowIconY + 5.0f);
-        RowTitle(ctx, pos, "Расположение", kRowTitleY + 5.0f);
-
-        int index = static_cast<int>(s.hud_corner) % static_cast<int>(std::size(kHudCornerNames));
-        if (Stepper(ctx, HashId("i-corner-s"), pos, col.w, pos.y + kRowH_Simple * 0.5f, index,
+        RowTitle(ctx, pos, title, kRowTitleY + 5.0f);
+        int index = static_cast<int>(corner) % static_cast<int>(std::size(kHudCornerNames));
+        if (Stepper(ctx, HashId(id, 7), pos, col.w, pos.y + kRowH_Simple * 0.5f, index,
                     static_cast<int>(std::size(kHudCornerNames)), kHudCornerNames[index])) {
-            s.hud_corner = static_cast<std::uint32_t>(index);
+            corner = static_cast<std::uint32_t>(index);
             dirty = true;
         }
+    };
+    if (s.show_record_indicator) corner_row("i-rec-corner", "Индикатор записи", s.record_corner);
+    if (badges) corner_row("i-corner", "Значки", s.hud_corner);
+
+    if (any_indicator) {
+        const ImVec2 pos = col.Next(kRowH_Simple);
+        Interaction row = Row(ctx, HashId("i-layout"), pos, ImVec2(col.w, kRowH_Simple), true);
+        RowIcon(ctx, row, pos, "setting-3", kRowIconY + 5.0f);
+        RowTitle(ctx, pos, "Настроить расположение", kRowTitleY + 5.0f);
+        if (row.clicked) hud_layout_ = true;
     }
 
-    if (badges) {
+    if (any_indicator) {
         const ImVec2 pos = col.Next(kRowH_Slider);
         Interaction row = Row(ctx, HashId("i-size"), pos, ImVec2(col.w, kRowH_Slider));
         RowIcon(ctx, row, pos, "monitor-recorder");
-        RowTitle(ctx, pos, "Размер значков");
+        RowTitle(ctx, pos, "Размер индикаторов");
         RowSubtitle(ctx, pos, "От 60% до 200%");
 
         float percent = s.hud_badge_scale * 100.0f;
@@ -1432,12 +1635,12 @@ void Menu::PageInterface(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVe
         }
     }
 
-    if (badges) {
+    if (any_indicator) {
         const ImVec2 pos = col.Next(kRowH_Slider);
         Interaction row = Row(ctx, HashId("i-alpha"), pos, ImVec2(col.w, kRowH_Slider));
         RowIcon(ctx, row, pos, "activity");
         RowTitle(ctx, pos, "Прозрачность");
-        RowSubtitle(ctx, pos, "Насколько значки видно");
+        RowSubtitle(ctx, pos, "Насколько индикаторы видно");
 
         float percent = s.hud_opacity * 100.0f;
         const std::string label = std::format("{}%", static_cast<int>(percent + 0.5f));
@@ -1472,6 +1675,8 @@ void Menu::PageKeybinds(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec
          &s.hotkey_save_replay_vk},
         {"kb-record", "record-circle", "Начать/остановить запись", &s.hotkey_toggle_record_mods,
          &s.hotkey_toggle_record_vk},
+        {"kb-replay-switch", "tick-circle", "Вкл/откл откаты", &s.hotkey_toggle_replay_mods,
+         &s.hotkey_toggle_replay_vk},
     };
 
     if (capture_row_ >= 0 && model.pending_vk != 0) {
@@ -1647,15 +1852,71 @@ void Menu::PageDisk(UiContext& ctx, ImVec2 panel_min, [[maybe_unused]] ImVec2 pa
     if (dirty && model.on_settings_changed) model.on_settings_changed();
 }
 
+namespace {
+
+constexpr std::string_view kFavoritesKey = "favorites";
+constexpr std::string_view kDesktopKey = "desktop";
+constexpr std::string_view kAppKeyPrefix = "app:";
+
+struct GalleryFilter {
+    std::string key;
+    std::string label;
+
+    [[nodiscard]] bool Matches(const GalleryItem& item) const {
+        if (key.empty()) return true;
+        if (key == kFavoritesKey) return item.favorite;
+        if (key == kDesktopKey) return item.app.empty();
+        return key.substr(kAppKeyPrefix.size()) == item.app;
+    }
+};
+
+std::vector<GalleryFilter> GalleryFilters(const std::vector<GalleryItem>& items) {
+    std::map<std::string, int> clips_by_app;
+    for (const GalleryItem& item : items) ++clips_by_app[item.app];
+
+    std::vector<GalleryFilter> filters{{"", Tr("Всё")}, {std::string(kFavoritesKey), Tr("Избранные")}};
+    for (const auto& [app, count] : clips_by_app) {
+        if (app.empty()) continue;
+        filters.push_back({std::string(kAppKeyPrefix) + app, std::format("{} ({})", app, count)});
+    }
+    if (const auto desktop = clips_by_app.find(""); desktop != clips_by_app.end())
+        filters.push_back({std::string(kDesktopKey),
+                           std::format("{} ({})", Tr("Рабочий стол"), desktop->second)});
+    return filters;
+}
+
+}
+
 void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppModel& model,
                        TextureCache& textures) {
     Column col{panel_min.x + kPanelPad, panel_min.y + kPanelPad, kPanelW - 2 * kPanelPad};
     col.bottom = &content_bottom_;
     DrawText(ctx, Font::H1, col.Next(kH1Height), kText, "галерея");
 
-    const auto& items = model.gallery_items;
-
     ReserveBackRow(ctx, panel_min, panel_max, col.w);
+
+    const std::vector<GalleryFilter> filters = GalleryFilters(model.gallery_items);
+    int filter_index = 0;
+    for (int i = 0; i < static_cast<int>(filters.size()); ++i)
+        if (filters[i].key == model.settings->gallery_filter) filter_index = i;
+    {
+        const ImVec2 pos = col.Next(kRowH_Simple);
+        Interaction row = Row(ctx, HashId("g-filter"), pos, ImVec2(col.w, kRowH_Simple));
+        DrawIcon(ctx, "setting-3", ImVec2(pos.x + kRowIconX, pos.y + 16.0f), kRowIcon, kText,
+                 1.0f + 0.10f * row.hover);
+        DrawText(ctx, Font::Body, ImVec2(pos.x + kRowTextX, pos.y + 15.0f), kText, "Показать");
+        if (Stepper(ctx, HashId("g-filter-s"), pos, col.w, pos.y + kRowH_Simple * 0.5f,
+                    filter_index, static_cast<int>(filters.size()),
+                    filters[filter_index].label.c_str())) {
+            model.settings->gallery_filter = filters[filter_index].key;
+            scroll_ = ScrollArea{};
+            if (model.on_settings_changed) model.on_settings_changed();
+        }
+    }
+
+    std::vector<const GalleryItem*> shown;
+    for (const GalleryItem& item : model.gallery_items)
+        if (filters[filter_index].Matches(item)) shown.push_back(&item);
 
     constexpr int kColumns = 4;
     constexpr float kTileGap = 6.0f;
@@ -1666,9 +1927,9 @@ void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMo
     {
         std::string current;
         int in_row = 0;
-        for (const auto& item : items) {
-            if (item.date_label != current) {
-                current = item.date_label;
+        for (const GalleryItem* item : shown) {
+            if (item->date_label != current) {
+                current = item->date_label;
                 if (in_row != 0) {
                     content_h += tile_h + kTileGap;
                     in_row = 0;
@@ -1691,7 +1952,8 @@ void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMo
     int column = 0;
     std::uint32_t index = 0;
 
-    for (const auto& item : items) {
+    for (const GalleryItem* shown_item : shown) {
+        const GalleryItem& item = *shown_item;
         if (item.date_label != current_date) {
             if (column != 0) {
                 y += tile_h + kTileGap;
@@ -1704,6 +1966,10 @@ void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMo
 
         const ImVec2 pos(col.x + column * (tile_w + kTileGap), y);
         const std::uint32_t id = HashId("g-tile", index++);
+        const ImVec2 star_min(pos.x + tile_w - kStarSize - 6.0f, pos.y + 6.0f);
+        const ImVec2 star_max(star_min.x + kStarSize, star_min.y + kStarSize);
+        const Interaction star = Hit(ctx, HashId("g-star", index), star_min, star_max, false);
+        ctx.Reserve(ctx.At(star_min), ctx.At(star_max));
         Interaction it = Hit(ctx, id, pos, ImVec2(pos.x + tile_w, pos.y + tile_h));
 
         const float scale = 1.0f + 0.06f * it.hover - 0.05f * it.press;
@@ -1736,16 +2002,44 @@ void Menu::PageGallery(UiContext& ctx, ImVec2 panel_min, ImVec2 panel_max, AppMo
                             10.0f, 0, 2.0f);
 
         DrawThumbBadge(ctx, ImVec2(pos.x + 4.0f, pos.y + 4.0f), item.duration_label.c_str());
+        if (item.duration_seconds > 0.0) {
+            for (const ClipMarker& marker : item.markers) {
+                const float along = std::clamp(
+                    static_cast<float>(marker.ms / 1000.0 / item.duration_seconds), 0.0f, 1.0f);
+                const float mx = a.x + 8.0f + (b.x - a.x - 16.0f) * along;
+                ctx.dl->AddRectFilled(ImVec2(mx - 1.5f, b.y - 12.0f), ImVec2(mx + 1.5f, b.y - 4.0f),
+                                      ctx.Fade(kMomentFlag), 1.5f);
+            }
+        }
 
-        if (it.clicked) OpenInPlayer(model, item.path);
+        if (item.favorite || it.hover > 0.01f || star.hover > 0.01f) {
+            const float visible = item.favorite ? 1.0f : std::max(it.hover, star.hover);
+            const float saved_alpha = ctx.alpha;
+            ctx.alpha *= visible;
+            DrawIcon(ctx, "star", star_min, kStarSize,
+                     item.favorite ? kFavoriteStar : IM_COL32(255, 255, 255, 170),
+                     1.0f + 0.15f * star.hover - 0.1f * star.press);
+            ctx.alpha = saved_alpha;
+        }
+
+        if (const auto replacing = model.replacing.find(item.path); replacing != model.replacing.end()) {
+            ctx.dl->AddRectFilled(a, b, ctx.Fade(IM_COL32(0, 0, 0, 160)), 10.0f);
+            DrawProgressRing(ctx, center, replacing->second);
+        } else if (it.clicked) {
+            OpenInPlayer(model, item.path);
+        }
+        if (star.clicked) model.gallery->ToggleFavorite(item.path);
 
         column = (column + 1) % kColumns;
         if (column == 0) y += tile_h + kTileGap;
     }
 
-    if (items.empty())
+    if (model.gallery_items.empty())
         DrawText(ctx, Font::Small, ImVec2(col.x, view_min.y + 8.0f), kTextMuted,
                  "Здесь появятся ваши записи и мгновенные повторы");
+    else if (shown.empty())
+        DrawText(ctx, Font::Small, ImVec2(col.x, view_min.y + 8.0f), kTextMuted,
+                 "Здесь пока пусто");
 
     scroll_.End(ctx);
 

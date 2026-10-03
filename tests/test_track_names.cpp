@@ -1,5 +1,7 @@
 #include "rf/mux/TrackNames.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -115,4 +117,54 @@ TEST(TrackNames_FullMixMarkerIsReadBack) {
     write_original();
     CHECK(WriteAudioTrackNames(path, {"Все звуки", "Микрофон"}, true).ok());
     CHECK(FirstAudioTrackIsFullMix(path));
+}
+
+TEST(ClipMarkers_RoundTripAndSurviveRenamingTheTracks) {
+    const Bytes original = Concat({MakeBox("ftyp", Bytes(16, 1)), MakeBox("mdat", Bytes(512, 0xCD)),
+                                   MakeBox("moov", Track("soun"))});
+    const auto path = std::filesystem::temp_directory_path() / "rf_markers_test.mp4";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(original.data()),
+                  static_cast<std::streamsize>(original.size()));
+    }
+
+    const std::vector<ClipMarker> markers{{1500, "kill"}, {4200, "ace"}};
+    CHECK(WriteClipMarkers(path, markers).ok());
+    CHECK(ReadClipMarkers(path) == markers);
+
+    CHECK(WriteAudioTrackNames(path, {"Game"}).ok());
+    CHECK(ReadClipMarkers(path) == markers);
+
+    const Bytes written = ReadAll(path);
+    CHECK(Contains(written, "chpl"));
+    CHECK(Contains(written, "<xmpDM:name>ace</xmpDM:name>"));
+    CHECK(Contains(written, std::string(512, '\xCD')));
+
+    CHECK(WriteClipMarkers(path, markers).ok());
+    const Bytes rewritten = ReadAll(path);
+    CHECK_EQ(rewritten.size(), written.size());
+    std::filesystem::remove(path);
+}
+
+TEST(ClipMarkers_ShowUpAsChaptersInOtherTools) {
+    const auto path = std::filesystem::temp_directory_path() / "rf_markers_ffprobe.mp4";
+    const std::string make = "ffmpeg -v error -y -f lavfi -i testsrc=duration=5:size=160x90:rate=10 \"" +
+                             path.string() + "\" 2>nul";
+    if (std::system(make.c_str()) != 0 || !std::filesystem::exists(path)) {
+        SKIP("ffmpeg is not installed");
+        return;
+    }
+    CHECK(WriteClipMarkers(path, {{1500, "kill"}, {4200, "ace"}}).ok());
+
+    const std::string probe = "ffprobe -v error -show_chapters -of csv=p=0 \"" + path.string() + "\"";
+    std::string output;
+    if (std::FILE* pipe = _popen(probe.c_str(), "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), pipe)) output += line;
+        _pclose(pipe);
+    }
+    CHECK(output.find("1.500000") != std::string::npos);
+    CHECK(output.find("ace") != std::string::npos);
+    std::filesystem::remove(path);
 }

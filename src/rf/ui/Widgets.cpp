@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <string>
 #include <vector>
 
@@ -488,6 +489,63 @@ void ScrollArea::Begin(UiContext& ctx, std::uint32_t id, ImVec2 min, ImVec2 max,
 void ScrollArea::End(UiContext& ctx) {
     ctx.offset.y += offset_;
     ctx.dl->PopClipRect();
+}
+
+std::optional<double> DrawMomentFlags(UiContext& ctx, const std::vector<ClipMarker>& markers,
+                                      ImVec2 bar_pos, float bar_w, float bar_h, double total_seconds) {
+    if (markers.empty() || total_seconds <= 0.0) return std::nullopt;
+    std::optional<double> seek;
+    std::uint32_t index = 0;
+    for (const ClipMarker& marker : markers) {
+        const double at = marker.ms / 1000.0;
+        if (at > total_seconds) continue;
+        const float x = bar_pos.x + bar_w * static_cast<float>(at / total_seconds);
+        const char* label = marker.tag.empty() ? " " : marker.tag.c_str();
+        const ImVec2 text = MeasureText(ctx, Font::BadgeItalic, label);
+        const ImVec2 pill_min(x - text.x * 0.5f - 4.0f, bar_pos.y - text.y - 10.0f);
+        const ImVec2 pill_max(x + text.x * 0.5f + 4.0f, bar_pos.y - 6.0f);
+
+        const Interaction it = Hit(ctx, HashId("moment", index++), pill_min,
+                                   ImVec2(pill_max.x, bar_pos.y + bar_h * 0.5f));
+        const float grow = 1.5f * it.hover;
+        ctx.dl->AddRectFilled(ctx.At(ImVec2(pill_min.x - grow, pill_min.y - grow)),
+                              ctx.At(ImVec2(pill_max.x + grow, pill_max.y + grow)),
+                              ctx.Fade(theme::kMomentFlag), 5.0f);
+        ctx.dl->AddLine(ctx.At(ImVec2(x, pill_max.y)), ctx.At(ImVec2(x, bar_pos.y + bar_h * 0.5f)),
+                        ctx.Fade(theme::kMomentFlag), 2.0f);
+        DrawText(ctx, Font::BadgeItalic, ImVec2(pill_min.x + 4.0f, pill_min.y + 2.0f), theme::kText, label);
+        if (it.clicked) seek = at;
+    }
+    return seek;
+}
+
+void DrawProgressRing(UiContext& ctx, ImVec2 center, float progress) {
+    constexpr float kRadius = 22.0f, kThickness = 6.0f;
+    constexpr float kDegToRadian = 3.14159265f / 180.0f;
+    constexpr ImU32 kRingTrack = IM_COL32(255, 255, 255, 51);
+    constexpr ImVec2 kLabel(25.0f, 11.0f);
+    ctx.dl->AddCircle(ctx.At(center), kRadius, ctx.Fade(kRingTrack), 64, kThickness);
+
+    progress = std::clamp(progress, 0.0f, 1.0f);
+    if (progress > 0.0f) {
+        const float start = -90.0f * kDegToRadian;
+        const float end = start + progress * 360.0f * kDegToRadian;
+        ctx.dl->PathArcTo(ctx.At(center), kRadius, start, end, 64);
+        ctx.dl->PathStroke(ctx.Fade(theme::kAppAccent), 0, kThickness);
+        for (const float angle : {start, end})
+            ctx.dl->AddCircleFilled(
+                ctx.At(ImVec2(center.x + std::cos(angle) * kRadius, center.y + std::sin(angle) * kRadius)),
+                kThickness * 0.5f, ctx.Fade(theme::kAppAccent), 16);
+    }
+
+    const ImVec2 label_min(center.x - kLabel.x * 0.5f, center.y - 5.0f);
+    ctx.dl->AddRectFilled(ctx.At(label_min), ctx.At(ImVec2(label_min.x + kLabel.x, label_min.y + kLabel.y)),
+                          ctx.Fade(kRingTrack), 3.0f);
+    const std::string percent = std::format("{}%", static_cast<int>(progress * 100.0f + 0.5f));
+    const ImVec2 size = MeasureText(ctx, Font::Micro, percent.c_str());
+    DrawText(ctx, Font::Micro,
+             ImVec2(label_min.x + (kLabel.x - size.x) * 0.5f, label_min.y + (kLabel.y - size.y) * 0.5f),
+             theme::kText, percent.c_str());
 }
 
 }

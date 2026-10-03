@@ -17,6 +17,7 @@ ClipScheduler::Result ClipScheduler::Add(std::uint32_t pre_seconds, std::uint32_
 
     pending_->start = std::min(pending_->start, start);
     pending_->deadline = std::max(pending_->deadline, deadline);
+    pending_->moments.push_back({now, std::string(tag)});
     if (!tag.empty() && std::find(pending_->tags.begin(), pending_->tags.end(), tag) ==
                             pending_->tags.end())
         pending_->tags.emplace_back(tag);
@@ -34,6 +35,7 @@ std::optional<ClipScheduler::Due> ClipScheduler::TakeDue(Ticks100ns now,
     Due due;
     due.seconds = static_cast<std::uint32_t>((span + kOneSecond100ns - 1) / kOneSecond100ns);
     due.tags = std::move(pending_->tags);
+    due.moments = std::move(pending_->moments);
     pending_.reset();
     saved_.push_back(now);
     return due;

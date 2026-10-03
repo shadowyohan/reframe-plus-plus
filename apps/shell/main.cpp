@@ -18,6 +18,7 @@
 #include <format>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -36,6 +37,7 @@
 #include "rf/engine/UpdateCheck.h"
 #include "rf/integrations/ControlServer.h"
 #include "rf/integrations/SdkHost.h"
+#include "rf/player/TrackMixer.h"
 #include "rf/ui/Hud.h"
 #include "rf/ui/Overlay.h"
 #include "rf/ui/Screens.h"
@@ -47,6 +49,7 @@ constexpr int kHotkeyRecord = 2;
 constexpr int kHotkeyReplay = 3;
 
 constexpr int kHotkeyEscape = 4;
+constexpr int kHotkeyToggleReplay = 5;
 
 constexpr UINT WM_RF_TRAY = WM_APP + 1;
 constexpr UINT kMenuOpen = 100;
@@ -219,6 +222,13 @@ struct App {
     std::atomic<const char*> stage{"idle"};
     std::atomic<std::uint64_t> ticks{0};
     std::thread watchdog;
+    rf::ForegroundAppNamer foreground_names;
+    rf::TrackMixer mixer;
+
+    std::optional<rf::Installer> offered_installer;
+    std::string offered_version;
+    std::atomic<bool> update_downloading{false};
+    std::thread update_download;
 
     bool quit = false;
 };
@@ -362,6 +372,10 @@ std::atomic<int> g_mouse_x{0};
 std::atomic<int> g_mouse_y{0};
 
 POINT g_mouse_origin{};
+std::atomic<int> g_mouse_left{0};
+std::atomic<int> g_mouse_top{0};
+std::atomic<int> g_mouse_right{1};
+std::atomic<int> g_mouse_bottom{1};
 std::atomic<bool> g_mouse_down{false};
 std::atomic<int> g_mouse_wheel{0};
 
@@ -373,11 +387,13 @@ LRESULT CALLBACK MouseCaptureProc(int code, WPARAM wparam, LPARAM lparam) {
 
                 const int dx = ms->pt.x - g_mouse_origin.x;
                 const int dy = ms->pt.y - g_mouse_origin.y;
-                const int w = ::GetSystemMetrics(SM_CXSCREEN);
-                const int h = ::GetSystemMetrics(SM_CYSCREEN);
-                g_mouse_x.store(std::clamp(g_mouse_x.load(std::memory_order_relaxed) + dx, 0, w - 1),
+                g_mouse_x.store(std::clamp(g_mouse_x.load(std::memory_order_relaxed) + dx,
+                                           g_mouse_left.load(std::memory_order_relaxed),
+                                           g_mouse_right.load(std::memory_order_relaxed) - 1),
                                 std::memory_order_relaxed);
-                g_mouse_y.store(std::clamp(g_mouse_y.load(std::memory_order_relaxed) + dy, 0, h - 1),
+                g_mouse_y.store(std::clamp(g_mouse_y.load(std::memory_order_relaxed) + dy,
+                                           g_mouse_top.load(std::memory_order_relaxed),
+                                           g_mouse_bottom.load(std::memory_order_relaxed) - 1),
                                 std::memory_order_relaxed);
                 return 1;
             }
@@ -404,15 +420,26 @@ LRESULT CALLBACK MouseCaptureProc(int code, WPARAM wparam, LPARAM lparam) {
     return ::CallNextHookEx(g_mouse_hook, code, wparam, lparam);
 }
 
-void SetMouseCaptureHook(bool wanted) {
+void SetMouseBounds(const RECT& bounds) {
+    g_mouse_left.store(bounds.left, std::memory_order_relaxed);
+    g_mouse_top.store(bounds.top, std::memory_order_relaxed);
+    g_mouse_right.store(std::max(bounds.right, bounds.left + 1), std::memory_order_relaxed);
+    g_mouse_bottom.store(std::max(bounds.bottom, bounds.top + 1), std::memory_order_relaxed);
+}
+
+void SetMouseCaptureHook(bool wanted, const RECT& bounds) {
+    SetMouseBounds(bounds);
     if (wanted == (g_mouse_hook != nullptr)) return;
     if (wanted) {
-
         POINT p{};
         if (::GetCursorPos(&p)) {
             g_mouse_origin = p;
-            g_mouse_x.store(p.x, std::memory_order_relaxed);
-            g_mouse_y.store(p.y, std::memory_order_relaxed);
+            g_mouse_x.store(std::clamp(static_cast<int>(p.x), static_cast<int>(bounds.left),
+                                       static_cast<int>(bounds.right) - 1),
+                            std::memory_order_relaxed);
+            g_mouse_y.store(std::clamp(static_cast<int>(p.y), static_cast<int>(bounds.top),
+                                       static_cast<int>(bounds.bottom) - 1),
+                            std::memory_order_relaxed);
         }
         g_mouse_down.store(false, std::memory_order_relaxed);
         g_mouse_hook = ::SetWindowsHookExW(WH_MOUSE_LL, MouseCaptureProc, nullptr, 0);
@@ -420,6 +447,9 @@ void SetMouseCaptureHook(bool wanted) {
     } else {
         ::UnhookWindowsHookEx(g_mouse_hook);
         g_mouse_hook = nullptr;
+        g_mouse_down.store(false, std::memory_order_relaxed);
+        ::SetCursorPos(g_mouse_x.load(std::memory_order_relaxed),
+                       g_mouse_y.load(std::memory_order_relaxed));
     }
 }
 
@@ -553,6 +583,27 @@ void WaitForInputOrTimeout(DWORD milliseconds) {
     ::MsgWaitForMultipleObjectsEx(0, nullptr, milliseconds, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 }
 
+bool IsShellWindow(HWND window) {
+    wchar_t window_class[32] = {};
+    ::GetClassNameW(window, window_class, ARRAYSIZE(window_class));
+    const std::wstring_view name(window_class);
+    return name == L"Progman" || name == L"WorkerW" || name == L"Shell_TrayWnd" ||
+           name == L"Shell_SecondaryTrayWnd";
+}
+
+HMONITOR MonitorForOverlay() {
+    HWND foreground = ::GetForegroundWindow();
+    DWORD pid = 0;
+    if (foreground) ::GetWindowThreadProcessId(foreground, &pid);
+    if (foreground && pid != ::GetCurrentProcessId() && !IsShellWindow(foreground) &&
+        !::IsIconic(foreground))
+        return ::MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+
+    POINT cursor{};
+    ::GetCursorPos(&cursor);
+    return ::MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+}
+
 bool ForegroundOwnsTheScreen() {
     HWND foreground = ::GetForegroundWindow();
     if (!foreground || foreground == g_app->overlay.hwnd()) return false;
@@ -561,11 +612,7 @@ bool ForegroundOwnsTheScreen() {
     ::GetWindowThreadProcessId(foreground, &pid);
     if (pid == ::GetCurrentProcessId()) return false;
 
-    wchar_t window_class[16] = {};
-    ::GetClassNameW(foreground, window_class, ARRAYSIZE(window_class));
-    if (std::wstring_view(window_class) == L"Progman" ||
-        std::wstring_view(window_class) == L"WorkerW")
-        return false;
+    if (IsShellWindow(foreground)) return false;
 
     RECT window{};
     if (!::GetWindowRect(foreground, &window)) return false;
@@ -638,7 +685,31 @@ void RefreshMicLabel() {
     app.model.mic_device_label = "Системный по умолчанию";
 }
 
+std::uint64_t RecordingBytesSoFar() {
+    const App& app = *g_app;
+    const double bits_per_second =
+        static_cast<double>(app.settings.bitrate_kbps + app.settings.audio_bitrate_kbps * 3) * 1000.0;
+    return static_cast<std::uint64_t>(bits_per_second / 8.0 * app.model.recording_seconds);
+}
+
+bool DiskLimitReached(std::uint64_t pending_bytes = 0) {
+    const App& app = *g_app;
+    if (!app.settings.disk_limit_enabled) return false;
+    const std::uint64_t limit = static_cast<std::uint64_t>(app.settings.disk_limit_gb) << 30;
+    return app.gallery.total_bytes() + pending_bytes >= limit;
+}
+
+void ReportDiskLimit() {
+    RF_WARN("the space limit of {} GB is reached - nothing more is saved", g_app->settings.disk_limit_gb);
+    g_app->hud.Push(rf::ui::Hud::Kind::Error, "Достигнут лимит места");
+}
+
 void ToggleRecording() {
+    const bool starting = g_app->recorder.state() != rf::Recorder::State::Recording;
+    if (starting && DiskLimitReached()) {
+        ReportDiskLimit();
+        return;
+    }
     PostEngine([] {
         App& app = *g_app;
         if (app.recorder.state() == rf::Recorder::State::Recording) {
@@ -660,14 +731,41 @@ void ToggleRecording() {
     });
 }
 
+void StopRecordingAtTheDiskLimit(bool recording) {
+    static bool stopping = false;
+    if (!recording) {
+        stopping = false;
+        return;
+    }
+    if (stopping || !DiskLimitReached(RecordingBytesSoFar())) return;
+    stopping = true;
+    ReportDiskLimit();
+    ToggleRecording();
+}
+
+void TrackForegroundApp() {
+    App& app = *g_app;
+    static rf::Ticks100ns last = 0;
+    const rf::Ticks100ns now = rf::Now100ns();
+    if (now - last < rf::MsTo100ns(250)) return;
+    last = now;
+    if (!app.recorder.tracks_foreground_app() || app.recorder.state() == rf::Recorder::State::Idle)
+        return;
+    app.recorder.RecordForegroundApp(app.foreground_names.AppOn(app.recorder.capture_monitor()));
+}
+
 void SaveReplay() {
+    if (DiskLimitReached()) {
+        ReportDiskLimit();
+        return;
+    }
     PostEngine([seconds = g_app->settings.replay_seconds,
                 release_saved = !g_app->sdk.armed_by_apps()] {
     App& app = *g_app;
     std::filesystem::path saved;
-    if (auto s = app.recorder.SaveReplay(&saved, seconds, release_saved); s.ok()) {
+    std::string app_name;
+    if (auto s = app.recorder.SaveReplay(&saved, seconds, release_saved, &app_name); s.ok()) {
 
-        const std::string app_name = app.recorder.target_app();
         app.hud.Push(rf::ui::Hud::Kind::ReplaySaved,
                      app_name.empty()
                          ? "Мгновенный повтор сохранен"
@@ -707,12 +805,147 @@ void ReportAppClip(const rf::integrations::DueClip& clip, const std::filesystem:
     app.gallery.Refresh();
 }
 
+void LaunchInstallerAndQuit(const std::filesystem::path& installer) {
+    SHELLEXECUTEINFOW info{sizeof(info)};
+    info.fMask = SEE_MASK_NOASYNC;
+    info.lpVerb = L"open";
+    info.lpFile = installer.c_str();
+    info.nShow = SW_SHOWNORMAL;
+    if (!::ShellExecuteExW(&info)) {
+        RF_ERROR("could not start the installer {}: {}", installer.string(), ::GetLastError());
+        g_app->hud.EndDownload();
+        g_app->hud.Push(rf::ui::Hud::Kind::Error, "Не удалось запустить установщик");
+        return;
+    }
+    RF_INFO("installer {} started - closing reframe++ so it can replace the files",
+            installer.string());
+    g_app->quit = true;
+}
+
+void InstallUpdate(const std::filesystem::path& installer) {
+    App& app = *g_app;
+    app.hud.SetDownload(rf::TrFormat("Устанавливаю reframe++ {}", app.offered_version), "reframe++",
+                        1.0f, "refresh-circle");
+    PostEngine([installer] {
+        if (g_app->recorder.state() == rf::Recorder::State::Recording) {
+            RF_INFO("finishing the recording before the update");
+            g_app->recorder.StopRecording();
+        }
+        PostUi([installer] { LaunchInstallerAndQuit(installer); });
+    });
+}
+
+void StartUpdateDownload() {
+    App& app = *g_app;
+    if (!app.offered_installer || app.update_downloading.exchange(true)) return;
+    if (app.update_download.joinable()) app.update_download.join();
+
+    const std::string label = rf::TrFormat("Скачиваю reframe++ {}", app.offered_version);
+    app.hud.SetDownload(label, "reframe++", 0.0f, "refresh-circle");
+    app.update_download = std::thread([installer = *app.offered_installer, label,
+                                       dir = app.settings.temp_dir / L"update"] {
+        ::SetThreadDescription(::GetCurrentThread(), L"rf-update-download");
+        int shown_percent = 0;
+        std::filesystem::path saved;
+        const rf::Status s = rf::DownloadInstaller(
+            installer, dir,
+            [&](float progress) {
+                const int percent = static_cast<int>(progress * 100.0f);
+                if (percent == shown_percent) return;
+                shown_percent = percent;
+                PostUi([label, progress] {
+                    g_app->hud.SetDownload(label, "reframe++", progress, "refresh-circle");
+                });
+            },
+            saved);
+        g_app->update_downloading = false;
+        if (!s.ok()) {
+            RF_ERROR("update download failed: {}", s.str());
+            PostUi([] {
+                g_app->hud.EndDownload();
+                g_app->hud.Push(rf::ui::Hud::Kind::Error, "Не удалось скачать обновление");
+            });
+            return;
+        }
+        RF_INFO("update downloaded and verified: {}", saved.string());
+        PostUi([saved] { InstallUpdate(saved); });
+    });
+}
+
+std::filesystem::path EditedCopyPath(const std::filesystem::path& original) {
+    const std::wstring stem = original.stem().wstring() + L"_edit";
+    std::filesystem::path candidate = original;
+    for (int attempt = 1;; ++attempt) {
+        candidate.replace_filename(stem + (attempt > 1 ? std::to_wstring(attempt) : L"") +
+                                   original.extension().wstring());
+        if (!std::filesystem::exists(candidate)) return candidate;
+    }
+}
+
+void SaveClipEdit(const rf::ui::ClipEdit& edit) {
+    App& app = *g_app;
+    rf::CropJob job;
+    job.raw = edit.file;
+    job.output = edit.replace_original ? edit.file : EditedCopyPath(edit.file);
+    job.frame_width = edit.width;
+    job.frame_height = edit.height;
+    job.bitrate_kbps = app.settings.bitrate_kbps;
+    job.trim_start = static_cast<rf::Ticks100ns>(edit.trim_start * rf::kOneSecond100ns);
+    job.trim_end = static_cast<rf::Ticks100ns>(edit.trim_end * rf::kOneSecond100ns);
+    job.audio_edits = edit.tracks;
+    job.audio_names = edit.kept_names;
+    job.first_track_is_full_mix = edit.first_kept_is_full_mix;
+    job.keep_raw = true;
+    job.background = false;
+    job.codec = static_cast<int>(app.settings.codec);
+
+    const std::uint64_t toast = app.next_toast_id++;
+    app.hud.PushProcessing(toast, "Сохраняю клип", {});
+    const std::string thumb = rf::ToUtf8(job.output.filename().wstring());
+    const std::filesystem::path locked = edit.replace_original ? edit.file : std::filesystem::path{};
+    if (!locked.empty()) app.model.replacing[locked] = 0.0f;
+    app.cropper.Push(
+        std::move(job),
+        [toast, locked](float progress) {
+            PostUi([toast, locked, progress] {
+                g_app->hud.SetProcessingProgress(toast, progress);
+                if (const auto it = g_app->model.replacing.find(locked); it != g_app->model.replacing.end())
+                    it->second = progress;
+            });
+        },
+        [toast, thumb, markers = edit.markers](const rf::Status& status, const rf::CropJob& done) {
+            if (status.ok() && !markers.empty()) {
+                if (auto s = rf::WriteClipMarkers(done.output, markers); !s.ok())
+                    RF_WARN("could not keep the moments of {}: {}", done.output.string(), s.str());
+            }
+            PostUi([toast, thumb, ok = status.ok(), output = done.output] {
+                App& a = *g_app;
+                a.model.replacing.erase(output);
+                a.overlay.textures().Remove(thumb);
+                a.gallery.ReloadThumbnail(output);
+                a.gallery.Refresh();
+                if (ok)
+                    a.hud.FinishProcessing(toast, rf::ui::Hud::Kind::ReplaySaved, "Клип сохранен", thumb, {});
+                else
+                    a.hud.FinishProcessing(toast, rf::ui::Hud::Kind::Error, "Не удалось сохранить клип", {}, {});
+            });
+        });
+}
+
 void SaveAppClip(rf::integrations::DueClip clip) {
+    if (DiskLimitReached()) {
+        ReportDiskLimit();
+        g_app->control.Send(clip.client,
+                            rf::integrations::SdkHost::FailedEvent("disk-full", clip.tags));
+        return;
+    }
     PostEngine([clip = std::move(clip)] {
         App& app = *g_app;
         rf::Recorder::GameClip saved;
+        std::vector<rf::Recorder::Moment> moments;
+        for (const auto& moment : clip.moments) moments.push_back({moment.at, moment.tag});
         const rf::Status s = app.recorder.SaveGameClip(
-            clip.app, rf::integrations::JoinTags(clip.tags), clip.seconds, saved);
+            clip.app, rf::integrations::JoinTags(clip.tags), clip.seconds, moments, saved);
         if (!s.ok()) {
             RF_WARN("SDK clip from {}: {}", clip.app, s.str());
             const bool empty = app.recorder.GetStatus().replay.video_packets == 0;
@@ -738,8 +971,12 @@ void SaveAppClip(rf::integrations::DueClip clip) {
             [toast](float progress) {
                 PostUi([toast, progress] { g_app->hud.SetProcessingProgress(toast, progress); });
             },
-            [clip, toast, thumb, seconds = saved.seconds](const rf::Status&,
-                                                          const rf::CropJob& job) {
+            [clip, toast, thumb, seconds = saved.seconds,
+             markers = saved.markers](const rf::Status&, const rf::CropJob& job) {
+                if (!markers.empty()) {
+                    if (auto s = rf::WriteClipMarkers(job.output, markers); !s.ok())
+                        RF_WARN("could not mark the moments of {}: {}", job.output.string(), s.str());
+                }
                 ReportAppClip(clip, job.output, seconds);
                 PostUi([clip, toast, thumb] {
                     g_app->hud.FinishProcessing(toast, rf::ui::Hud::Kind::ReplaySaved,
@@ -805,6 +1042,15 @@ void SetReplayArmed(bool armed) {
     app.replay_pending = true;
     app.settings.replay_enabled = armed;
     app.model.replay_armed = armed;
+}
+
+void ToggleReplayFromHotkey() {
+    App& app = *g_app;
+    const bool armed = !app.settings.replay_enabled;
+    SetReplayArmed(armed);
+    if (app.sdk.armed_by_apps())
+        app.hud.Push(rf::ui::Hud::Kind::ReplayArmed,
+                     armed ? "Мгновенный повтор включен" : "Мгновенный повтор выключен");
 }
 
 void ApplyReplayState() {
@@ -902,12 +1148,8 @@ void OnHotkey(int id) {
         case kHotkeyOverlay: g_app->menu.ToggleOpen(); break;
         case kHotkeyRecord:  ToggleRecording(); break;
         case kHotkeyReplay:  SaveReplay(); break;
-        case kHotkeyEscape:
-            if (g_app->menu.player_open())
-                g_app->menu.ClosePlayer(g_app->model);
-            else if (g_app->menu.open())
-                g_app->menu.Close();
-            break;
+        case kHotkeyEscape: g_app->menu.Escape(g_app->model); break;
+        case kHotkeyToggleReplay: ToggleReplayFromHotkey(); break;
         default: break;
     }
 }
@@ -1044,6 +1286,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     app.applied_gpu_luid_low = app.settings.gpu_luid_low;
     app.applied_gpu_luid_high = app.settings.gpu_luid_high;
 
+    app.model.mixer = &app.mixer;
+    app.model.on_save_edit = SaveClipEdit;
+    app.gallery.LoadFavorites(rf::paths::DataDir() / L"favorites.txt");
     app.gallery.Start(app.settings.output_dir);
 
     rf::D3DDevicePtr ui_device;
@@ -1066,12 +1311,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     }
 
     app.overlay.on_hotkey = OnHotkey;
-    app.overlay.on_escape = [] {
-
-        if (g_app->menu.player_open())
-            g_app->menu.ClosePlayer(g_app->model);
-        else if (g_app->menu.open())
-            g_app->menu.Close();
+    app.overlay.on_escape = [] { g_app->menu.Escape(g_app->model); };
+    app.hud.on_download_update = [] { StartUpdateDownload(); };
+    app.hud.on_layout_moved = [](const rf::ui::Hud::Badges& layout) {
+        App& a = *g_app;
+        a.settings.hud_corner = layout.corner;
+        a.settings.record_corner = layout.record_corner;
+        a.settings.badges_at_x = layout.badges_at.x;
+        a.settings.badges_at_y = layout.badges_at.y;
+        a.settings.record_at_x = layout.record_at.x;
+        a.settings.record_at_y = layout.record_at.y;
+        a.settings_dirty = true;
+        a.settings_touched = rf::Now100ns();
     };
     app.hud.on_stop = [] {
         if (g_app->recorder.state() == rf::Recorder::State::Recording) ToggleRecording();
@@ -1116,12 +1367,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
                         app.settings.hotkey_save_replay_vk,
                         {{MOD_CONTROL | MOD_ALT, VK_F10}, {MOD_CONTROL | MOD_SHIFT, VK_F10}},
                         "replay");
+    std::tie(app.settings.hotkey_toggle_replay_mods, app.settings.hotkey_toggle_replay_vk) =
+        register_hotkey(kHotkeyToggleReplay, app.settings.hotkey_toggle_replay_mods,
+                        app.settings.hotkey_toggle_replay_vk,
+                        {{MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_F10}, {MOD_ALT | MOD_SHIFT, VK_F8}},
+                        "replay switch");
 
     app.model.on_hotkeys_changed = []() -> bool {
         App& a = *g_app;
         ::UnregisterHotKey(a.overlay.hwnd(), kHotkeyOverlay);
         ::UnregisterHotKey(a.overlay.hwnd(), kHotkeyRecord);
         ::UnregisterHotKey(a.overlay.hwnd(), kHotkeyReplay);
+        ::UnregisterHotKey(a.overlay.hwnd(), kHotkeyToggleReplay);
 
         const bool ok =
             ::RegisterHotKey(a.overlay.hwnd(), kHotkeyOverlay,
@@ -1132,7 +1389,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
                              a.settings.hotkey_toggle_record_vk) &&
             ::RegisterHotKey(a.overlay.hwnd(), kHotkeyReplay,
                              a.settings.hotkey_save_replay_mods | MOD_NOREPEAT,
-                             a.settings.hotkey_save_replay_vk);
+                             a.settings.hotkey_save_replay_vk) &&
+            ::RegisterHotKey(a.overlay.hwnd(), kHotkeyToggleReplay,
+                             a.settings.hotkey_toggle_replay_mods | MOD_NOREPEAT,
+                             a.settings.hotkey_toggle_replay_vk);
 
         a.model.record_hotkey = rf::ui::DescribeHotkey(a.settings.hotkey_toggle_record_mods,
                                                        a.settings.hotkey_toggle_record_vk);
@@ -1163,6 +1423,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
 
             app.model.gpus.push_back({name, adapters[i].luid_low, adapters[i].luid_high});
         }
+
+        for (const rf::Codec codec : {rf::Codec::HEVC, rf::Codec::AV1}) {
+            const bool encodable = std::any_of(adapters.begin(), adapters.end(), [&](const rf::AdapterInfo& a) {
+                return rf::HasHardwareEncoder(a.vendor, codec);
+            });
+            if (encodable) app.model.codecs.push_back(codec);
+            if (rf::CanDecode(codec)) app.model.playable_codecs.push_back(codec);
+            RF_INFO("{}: {} on this PC, {} to play back", rf::ToString(codec),
+                    encodable ? "can be recorded" : "cannot be recorded", rf::CanDecode(codec) ? "able" : "unable");
+        }
+        if (std::find(app.model.codecs.begin(), app.model.codecs.end(), app.settings.codec) == app.model.codecs.end())
+            app.settings.codec = rf::Codec::H264;
     }
 
     RefreshMonitors();
@@ -1211,10 +1483,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     app.updates.on_update = [](const rf::Release& release) {
         const std::string version =
             release.tag.starts_with('v') ? release.tag.substr(1) : release.tag;
-        PostUi([version] {
-            g_app->hud.PushUpdate(
-                rf::TrFormat("Доступна новая версия reframe++ {} — скачайте на GitHub", version),
-                version);
+        PostUi([version, installer = release.installer] {
+            g_app->offered_installer = installer;
+            g_app->offered_version = version;
+            g_app->hud.PushUpdate(rf::TrFormat("Доступна новая версия reframe++ {}", version),
+                                  version, installer.has_value());
         });
     };
     app.updates.Start(RF_VERSION);
@@ -1244,6 +1517,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
 
         const bool recording = app.recorder.state() == rf::Recorder::State::Recording;
         app.model.recording = recording;
+        StopRecordingAtTheDiskLimit(recording);
+        TrackForegroundApp();
 
         if (!app.replay_pending)
             app.model.replay_armed = app.settings.replay_enabled &&
@@ -1295,9 +1570,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         badges.replay = app.settings.show_replay_indicator &&
                         (app.model.replay_armed || armed_by_apps) && !recording;
         badges.corner = app.settings.hud_corner;
+        badges.record_corner = app.settings.record_corner;
+        badges.badges_at = ImVec2(app.settings.badges_at_x, app.settings.badges_at_y);
+        badges.record_at = ImVec2(app.settings.record_at_x, app.settings.record_at_y);
         badges.scale = app.settings.hud_badge_scale;
         badges.opacity = app.settings.hud_opacity;
         app.hud.SetBadges(badges);
+        app.hud.SetLayoutEditing(app.menu.editing_hud_layout());
 
         for (std::string& name : app.recorder.TakeOverflowedApps())
             app.hud.PushTrackLimit(std::move(name));
@@ -1346,6 +1625,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         was_menu_open = app.menu.open();
 
         app.stage = "window-style";
+        if (!g_mouse_hook) app.overlay.FollowMonitor(MonitorForOverlay());
 
         const bool drawn_in_game = app.recorder.capture_is_hooked();
         app.overlay.SetInteractive(app.menu.open() && !drawn_in_game &&
@@ -1366,7 +1646,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         ReleaseCursorForMenu(menu_over_game);
 
         const bool in_game_menu = menu_over_game;
-        SetMouseCaptureHook(in_game_menu);
+        SetMouseCaptureHook(in_game_menu, app.overlay.bounds());
         app.overlay.SetExternalMouse(
             in_game_menu,
             ImVec2(static_cast<float>(g_mouse_x.load(std::memory_order_relaxed)),
@@ -1395,17 +1675,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         was_on_screen = on_screen;
         last_foreground = foreground_now;
 
-        bool over_pill = false;
-        if (!app.menu.open() && recording) {
-            POINT cursor{};
-
+        bool over_hud_button = false;
+        POINT cursor{};
+        if (!app.menu.open() && ::GetCursorPos(&cursor) &&
+            ::ScreenToClient(app.overlay.hwnd(), &cursor)) {
             const float scale = app.overlay.ui_scale();
-            const ImVec4 r = app.hud.pill_rect();
-            if (r.z > r.x && ::GetCursorPos(&cursor))
-                over_pill = cursor.x >= r.x * scale - 4 && cursor.x <= r.z * scale + 4 &&
-                            cursor.y >= r.y * scale - 4 && cursor.y <= r.w * scale + 4;
+            const auto under_cursor = [&](const ImVec4& r) {
+                return r.z > r.x && cursor.x >= r.x * scale - 4 && cursor.x <= r.z * scale + 4 &&
+                       cursor.y >= r.y * scale - 4 && cursor.y <= r.w * scale + 4;
+            };
+            over_hud_button = (recording && under_cursor(app.hud.pill_rect())) ||
+                              std::any_of(app.hud.button_rects().begin(),
+                                          app.hud.button_rects().end(), under_cursor);
         }
-        app.overlay.SetClickable(over_pill);
+        app.overlay.SetClickable(over_hud_button);
 
         if (app.pending_rebind.exchange(false)) {
             if (auto s = app.overlay.RebindDevice(app.recorder.device()); !s.ok()) {
@@ -1429,11 +1712,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
             continue;
         }
 
-        app.overlay.SetUiScale(app.settings.ui_scale);
+        const bool pointer_held = ::GetAsyncKeyState(VK_LBUTTON) < 0 ||
+                                  g_mouse_down.load(std::memory_order_relaxed);
+        if (!pointer_held) app.overlay.SetUiScale(app.settings.ui_scale);
 
         app.stage = "render";
         if (rf::ui::UiContext* ctx = app.overlay.BeginFrame()) {
             const ImVec2 screen = app.overlay.design_size();
+            app.menu.SetForeignPanels(app.hud.hit_rects());
             app.menu.Draw(*ctx, screen, app.model, app.overlay.textures());
             app.hud.Draw(*ctx, screen, app.overlay.textures());
             app.stage = "present";
@@ -1455,6 +1741,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     app.task_cv.notify_all();
     if (app.engine.joinable()) app.engine.join();
     app.updates.Stop();
+    if (app.update_download.joinable()) app.update_download.join();
+    app.mixer.Close();
     app.cropper.Stop();
     app.control.Stop();
     if (app.watchdog.joinable()) app.watchdog.join();

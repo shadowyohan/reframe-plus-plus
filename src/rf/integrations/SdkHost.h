@@ -19,6 +19,7 @@ struct DueClip {
     std::string app;
     std::uint32_t seconds = 0;
     std::vector<std::string> tags;
+    std::vector<ClipScheduler::Moment> moments;
 };
 
 struct Outgoing {
