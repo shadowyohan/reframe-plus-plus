@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(ReframePlusPlus
-        VERSION 2.2.0
+        VERSION 2.2.1
         DESCRIPTION "Low-overhead GPU screen recorder with instant replay (NVIDIA + AMD + Intel)"
         LANGUAGES CXX C)
 
@@ -9,7 +9,12 @@ if(NOT WIN32)
     message(FATAL_ERROR "Reframe++ is a Windows-only project (D3D11 / DXGI / WGC / Media Foundation).")
 endif()
 
-set(RF_BUILD_NUMBER 1200)
+set(RF_BUILD_NUMBER 1210)
+if(PROJECT_VERSION_PATCH)
+    set(RF_DISPLAY_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}")
+else()
+    set(RF_DISPLAY_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,7 +52,7 @@ if(RF_ISCC)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/build/installer"
         COMMAND "${RF_ISCC}"
                 "/DBuildDir=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
-                "/DAppVersion=${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}"
+                "/DAppVersion=${RF_DISPLAY_VERSION}"
                 "${CMAKE_SOURCE_DIR}/installer/reframe.iss"
         DEPENDS reframe
         COMMENT "Building the installer with Inno Setup"

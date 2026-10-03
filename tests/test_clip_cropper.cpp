@@ -353,7 +353,7 @@ TEST(ClipCropper_EditorTrimsDropsAndQuietensTracks) {
     const std::string make = std::format(
         "ffmpeg -v error -y -f lavfi -i testsrc=duration=4:size=320x240:rate=30 "
         "-f lavfi -i sine=frequency=440:duration=4 -f lavfi -i sine=frequency=880:duration=4 "
-        "-map 0 -map 1 -map 2 -c:v libx264 -g 30 -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2 \"{}\" 2>nul",
+        "-filter_complex [2:a]volume=0.25[quiet] -map 0 -map 1 -map [quiet] -c:v libx264 -g 30 -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2 \"{}\" 2>nul",
         source.string());
     if (std::system(make.c_str()) != 0 || !std::filesystem::exists(source)) {
         SKIP("ffmpeg with libx264 is not installed");

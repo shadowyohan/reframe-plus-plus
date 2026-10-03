@@ -243,17 +243,25 @@ Status OpenClip(const CropJob& job, const std::filesystem::path& temp, IMFDXGIDe
     clip.fallback_pitch =
         ::MFGetAttributeUINT32(decoded.Get(), MF_MT_DEFAULT_STRIDE, clip.decoded_width);
 
-    std::size_t audio_number = 0;
-    std::vector<ComPtr<IMFMediaType>> pcm_inputs;
+    std::vector<DWORD> audio_indices;
     for (DWORD index = 0;; ++index) {
-        Clip::AudioStream stream{index};
-        if (FAILED(clip.reader->GetNativeMediaType(index, 0, &stream.type))) break;
+        ComPtr<IMFMediaType> native;
+        if (FAILED(clip.reader->GetNativeMediaType(index, 0, &native))) break;
         GUID major{};
-        if (FAILED(stream.type->GetGUID(MF_MT_MAJOR_TYPE, &major)) || major != MFMediaType_Audio)
-            continue;
-        const AudioEdit edit =
-            audio_number < job.audio_edits.size() ? job.audio_edits[audio_number] : AudioEdit{};
-        ++audio_number;
+        if (SUCCEEDED(native->GetGUID(MF_MT_MAJOR_TYPE, &major)) && major == MFMediaType_Audio)
+            audio_indices.push_back(index);
+    }
+    std::vector<std::size_t> file_order = MediaFoundationAudioOrder(job.raw);
+    if (file_order.size() != audio_indices.size()) {
+        file_order.resize(audio_indices.size());
+        for (std::size_t i = 0; i < file_order.size(); ++i) file_order[i] = i;
+    }
+
+    std::vector<ComPtr<IMFMediaType>> pcm_inputs;
+    for (std::size_t track = 0; track < audio_indices.size(); ++track) {
+        Clip::AudioStream stream{audio_indices[file_order[track]]};
+        if (FAILED(clip.reader->GetNativeMediaType(stream.source, 0, &stream.type))) continue;
+        const AudioEdit edit = track < job.audio_edits.size() ? job.audio_edits[track] : AudioEdit{};
         if (!edit.keep) continue;
 
         ComPtr<IMFMediaType> read_as = stream.type;
@@ -263,8 +271,8 @@ Status OpenClip(const CropJob& job, const std::filesystem::path& temp, IMFDXGIDe
             stream.gain = edit.gain;
             stream.decoded = true;
         }
-        if (SUCCEEDED(clip.reader->SetStreamSelection(index, TRUE)) &&
-            SUCCEEDED(clip.reader->SetCurrentMediaType(index, nullptr, read_as.Get()))) {
+        if (SUCCEEDED(clip.reader->SetStreamSelection(stream.source, TRUE)) &&
+            SUCCEEDED(clip.reader->SetCurrentMediaType(stream.source, nullptr, read_as.Get()))) {
             pcm_inputs.push_back(read_as);
             clip.audio.push_back(std::move(stream));
         }

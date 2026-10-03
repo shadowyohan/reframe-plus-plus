@@ -493,4 +493,27 @@ Status RepairDurations(const std::filesystem::path& file) {
     return WriteMovieHeader(raw, header);
 }
 
+std::vector<std::size_t> MediaFoundationAudioOrder(const std::filesystem::path& file) {
+    std::vector<std::uint32_t> ids;
+    std::FILE* raw = _wfopen(file.c_str(), L"rb");
+    if (raw) {
+        std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(raw, &std::fclose);
+        MovieHeader header;
+        if (ReadMovieHeader(raw, file, header).ok()) {
+            for (Box& trak : header.moov.children) {
+                if (!IsSoundTrack(trak)) continue;
+                const Box* tkhd = Child(trak, kTkhd);
+                if (!tkhd || tkhd->body.size() < 28) continue;
+                const std::size_t id_at = tkhd->body[0] == 1 ? 20 : 12;
+                ids.push_back(ReadU32(tkhd->body.data() + id_at));
+            }
+        }
+    }
+    std::vector<std::size_t> order(ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i)
+        order[i] = static_cast<std::size_t>(std::count_if(ids.begin(), ids.end(),
+                                                           [&](std::uint32_t other) { return other > ids[i]; }));
+    return order;
+}
+
 }

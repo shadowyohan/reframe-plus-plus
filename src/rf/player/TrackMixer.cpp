@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "rf/core/Log.h"
+#include "rf/mux/TrackNames.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -72,7 +73,13 @@ void TrackMixer::Pause() { playing_ = false; }
 void TrackMixer::Seek(double seconds) { seek_to_ = std::max(0.0, seconds); }
 
 Status TrackMixer::OpenTracks(std::vector<Track>& tracks) const {
-    for (std::size_t wanted = 0; wanted < track_count_; ++wanted) {
+    std::vector<std::size_t> file_order = MediaFoundationAudioOrder(file_);
+    if (file_order.size() != track_count_) {
+        file_order.resize(track_count_);
+        for (std::size_t i = 0; i < track_count_; ++i) file_order[i] = i;
+    }
+    for (std::size_t file_track = 0; file_track < track_count_; ++file_track) {
+        const std::size_t wanted = file_order[file_track];
         Track track;
         RF_HR(::MFCreateSourceReaderFromURL(file_.c_str(), nullptr, &track.reader));
         RF_HR(track.reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));

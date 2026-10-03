@@ -200,7 +200,9 @@ void VideoPlayer::SelectFirstAudioStream() {
     DWORD count = 0;
     if (FAILED(ex->GetNumberOfStreams(&count)) || count == 0) return;
 
-    bool first_audio = true;
+    const std::vector<std::size_t> file_order = MediaFoundationAudioOrder(file_);
+    const std::size_t first_track = file_order.empty() ? 0 : file_order.front();
+    std::size_t audio_rank = 0;
     for (DWORD i = 0; i < count; ++i) {
         PROPVARIANT type;
         ::PropVariantInit(&type);
@@ -209,8 +211,8 @@ void VideoPlayer::SelectFirstAudioStream() {
             type.vt == VT_CLSID && *type.puuid == MFMediaType_Audio;
         ::PropVariantClear(&type);
         if (!is_audio) continue;
-        ex->SetStreamSelection(i, first_audio);
-        first_audio = false;
+        ex->SetStreamSelection(i, audio_rank == first_track);
+        ++audio_rank;
     }
     ex->ApplyStreamSelections();
 }

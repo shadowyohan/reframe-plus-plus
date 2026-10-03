@@ -16,6 +16,8 @@ Status WriteAudioTrackNames(const std::filesystem::path& file,
 [[nodiscard]] std::vector<std::string> ReadAudioTrackNames(const std::filesystem::path& file);
 Status RepairDurations(const std::filesystem::path& file);
 
+[[nodiscard]] std::vector<std::size_t> MediaFoundationAudioOrder(const std::filesystem::path& file);
+
 struct ClipMarker {
     std::uint32_t ms = 0;
     std::string tag;
