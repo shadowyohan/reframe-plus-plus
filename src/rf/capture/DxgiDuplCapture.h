@@ -35,6 +35,7 @@ private:
     Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
 
     CursorPainter cursor_;
+    bool pointer_left_out_ = false;
     bool cursor_ready_ = false;
     std::int32_t desktop_x_ = 0;
     std::int32_t desktop_y_ = 0;

@@ -120,6 +120,12 @@ void DxgiDuplCapture::CaptureLoop() {
             continue;
         }
 
+        if (info.LastMouseUpdateTime.QuadPart != 0 && info.PointerPosition.Visible != pointer_left_out_) {
+            pointer_left_out_ = info.PointerPosition.Visible != FALSE;
+            RF_INFO("Windows {} the mouse pointer apart from the desktop image",
+                    pointer_left_out_ ? "now draws" : "no longer draws");
+        }
+
         const Ticks100ns present = QpcTo100ns(info.LastPresentTime.QuadPart);
 
         const bool has_new_image = info.AccumulatedFrames > 0 && present != 0 && present != last_present;
@@ -131,7 +137,7 @@ void DxgiDuplCapture::CaptureLoop() {
             if (SUCCEEDED(resource.As(&acquired))) {
 
                 ID3D11Texture2D* picture = acquired.Get();
-                if (target_.capture_cursor) {
+                if (target_.capture_cursor && pointer_left_out_) {
                     if (!cursor_ready_) {
                         if (auto s = cursor_.Init(device_, width_, height_, format_); s.ok())
                             cursor_ready_ = true;
